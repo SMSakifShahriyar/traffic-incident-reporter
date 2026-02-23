@@ -1,0 +1,50 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from dotenv import dotenv_values
+from pydantic import BaseModel, Field, ValidationError, model_validator
+
+
+class AppConfig(BaseModel):
+
+    frame_sample_fps: float = Field(default=2.0, gt=0)
+    short_side_resize: int = Field(default=640, gt=0)
+    min_segment_sec: float = Field(default=2.0, gt=0)
+    max_segment_sec: float = Field(default=8.0, gt=0)
+    energy_window_sec: float = Field(default=1.5, gt=0)
+    energy_threshold_quantile: float = Field(default=0.85, ge=0.0, le=1.0)
+    merge_gap_sec: float = Field(default=1.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def validate_segment_bounds(self) -> "AppConfig":
+        if self.min_segment_sec > self.max_segment_sec:
+            raise ValueError("min_segment_sec must be less than or equal to max_segment_sec")
+        return self
+
+
+def _extract_overrides(raw_env: dict[str, str | None]) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for field_name in AppConfig.model_fields:
+        plain_key = field_name.upper()
+        prefixed_key = f"APP_{plain_key}"
+        value = raw_env.get(prefixed_key)
+        if value in (None, ""):
+            value = raw_env.get(plain_key)
+        if value not in (None, ""):
+            overrides[field_name] = value
+    return overrides
+
+
+def load_app_config(env_path: str | Path | None = None) -> AppConfig:
+
+    env_file = Path(env_path) if env_path else Path(".env")
+    raw_env: dict[str, str | None] = {}
+    if env_file.exists():
+        raw_env = dict(dotenv_values(env_file))
+
+    overrides = _extract_overrides(raw_env)
+    try:
+        return AppConfig(**overrides)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid configuration values in {env_file}:\n{exc}") from exc

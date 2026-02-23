@@ -1,0 +1,728 @@
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .detect_track import assign_actor_roles_from_tracks
+from .openai_client import OpenAIResponsesClient
+from .schema import Actor, Audit, Claim, EventType, IncidentReport, Meta, OverallAssessment, Segment, Severity
+
+
+_FRAME_ID_PATTERN = re.compile(r"f_(\d+)\.(?:jpg|jpeg|png)$", re.IGNORECASE)
+_TOKEN_PATTERN = re.compile(r"[^a-z0-9]+")
+_SANITIZE_PATTERN = re.compile(r"[^A-Za-z0-9_-]+")
+_UNDERSCORE_PATTERN = re.compile(r"_+")
+
+_ROLE_SET = {"car", "bus", "truck", "motorcycle", "bicycle", "pedestrian", "unknown"}
+_SPECULATIVE_TOKENS = (
+    "appears",
+    "possibly",
+    "may",
+    "unclear",
+    "risk",
+    "potential",
+    "might",
+    "could",
+    "likely",
+)
+
+
+def _compact_actor_description(raw_description: str, role: str, confidence: float) -> str:
+
+    clean = " ".join(str(raw_description).strip().split())
+    if not clean:
+        return f"Perceived {role} participant."
+
+    first_sentence = re.split(r"(?<=[.!?])\s+", clean)[0].strip()
+    if len(first_sentence) > 120 or first_sentence.count(",") >= 2:
+        return f"Perceived {role} participant (confidence={confidence:.2f})."
+    return first_sentence
+
+
+def _clamp_confidence(value: Any) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if parsed < 0.0:
+        return 0.0
+    if parsed > 1.0:
+        return 1.0
+    return parsed
+
+
+def _conflict_texts(perception: dict[str, Any]) -> list[str]:
+    conflicts = perception.get("potential_conflicts", [])
+    if not isinstance(conflicts, list):
+        return []
+
+    texts: list[str] = []
+    for item in conflicts:
+        if not isinstance(item, dict):
+            continue
+        conflict_type = str(item.get("type", "")).strip().lower()
+        description = str(item.get("description", "")).strip().lower()
+        if conflict_type:
+            texts.append(conflict_type)
+        if description:
+            texts.append(description)
+    return texts
+
+
+def _contains_keyword(text: str, keyword: str) -> bool:
+    source = str(text).lower()
+    token = str(keyword).strip().lower()
+    if not token:
+        return False
+    pattern = r"(?<![a-z0-9])" + re.escape(token).replace(r"\ ", r"\s+") + r"(?![a-z0-9])"
+    return re.search(pattern, source) is not None
+
+
+def _has_any(texts: list[str], keywords: tuple[str, ...]) -> bool:
+    return any(any(_contains_keyword(text, keyword) for keyword in keywords) for text in texts)
+
+
+def _tokenize(value: str) -> list[str]:
+    lowered = value.lower()
+    tokens = [token for token in _TOKEN_PATTERN.split(lowered) if token]
+    return tokens
+
+
+def _sanitize_segment_id(segment_id: str) -> str:
+    raw = segment_id.strip()
+    if not raw:
+        raw = "seg"
+    cleaned = _SANITIZE_PATTERN.sub("_", raw)
+    cleaned = _UNDERSCORE_PATTERN.sub("_", cleaned).strip("_")
+    return cleaned or "seg"
+
+
+def build_report_filename(video_stem: str, segment_id: str, event_type: str) -> str:
+
+    return f"{build_report_id(video_stem, segment_id, event_type)}_report.json"
+
+
+def build_report_id(video_stem: str, segment_id: str, event_type: str) -> str:
+
+    safe_video = _sanitize_segment_id(video_stem)
+    safe_segment = _sanitize_segment_id(segment_id)
+    safe_event = _sanitize_segment_id(event_type)
+
+    segment_tokens = _tokenize(safe_segment)
+    event_tokens = _tokenize(safe_event)
+    has_event_tokens = bool(event_tokens) and all(token in segment_tokens for token in event_tokens)
+
+    if has_event_tokens:
+        base = f"{safe_video}_{safe_segment}"
+    else:
+        base = f"{safe_video}_{safe_segment}_{safe_event}"
+    base = _UNDERSCORE_PATTERN.sub("_", base).strip("_")
+    return base
+
+
+def map_actor_role(raw_actor: dict[str, Any]) -> str:
+
+    actor_type = str(raw_actor.get("type", "unknown")).strip().lower()
+    description = str(raw_actor.get("description", "")).strip().lower()
+    text = f"{actor_type} {description}".strip()
+
+    if actor_type in {"car", "bus", "truck", "motorcycle", "bicycle", "pedestrian", "unknown"}:
+        return actor_type
+    if actor_type in {"cyclist", "cycle"}:
+        return "bicycle"
+    if actor_type in {"van", "minibus"}:
+                                                                    
+        return "unknown"
+
+    if actor_type == "vehicle":
+        if any(token in text for token in ("van", "minibus")):
+            return "unknown"
+        if any(token in text for token in ("car", "sedan", "hatchback", "coupe")):
+            return "car"
+        if "truck" in text:
+            return "truck"
+        if "bus" in text:
+            return "bus"
+        if any(token in text for token in ("motorcycle", "motorbike")):
+            return "motorcycle"
+        if any(token in text for token in ("bicycle", "pedal bike", "cycle", "bike")):
+            return "bicycle"
+        return "unknown"
+
+    return "unknown"
+
+
+def infer_event_type(perception: dict[str, Any]) -> str:
+
+    texts = _conflict_texts(perception)
+    if not texts:
+        return EventType.none.value
+
+    if _has_any(texts, ("collision", "crash", "impact", "hit")):
+        return EventType.collision.value
+    if _has_any(texts, ("near_miss", "near miss", "close call", "almost", "risk")):
+        return EventType.near_miss.value
+
+    has_obstruction = _has_any(texts, ("obstruction", "blocked", "blockage", "blocking"))
+    has_violation = _has_any(texts, ("violation", "red light", "illegal", "wrong way", "crossing line"))
+
+    if has_obstruction and not has_violation:
+        return EventType.obstruction.value
+    if has_violation and not has_obstruction:
+        return EventType.violation.value
+    return EventType.none.value
+
+
+def infer_severity(perception: dict[str, Any]) -> str:
+
+    event_type = infer_event_type(perception)
+    texts = _conflict_texts(perception)
+    notes = str(perception.get("notes", "")).lower()
+    scene = perception.get("scene_conditions", {})
+    scene_text = json.dumps(scene).lower() if isinstance(scene, dict) else ""
+    all_text = " ".join(texts + [notes, scene_text])
+
+    lane_blockage = any(
+        token in all_text
+        for token in ("lane blockage", "lane blocked", "blocking lane", "blocked lane", "lane obstructed")
+    )
+
+    if event_type == EventType.collision.value:
+        return Severity.high.value if lane_blockage else Severity.medium.value
+    if event_type in {EventType.near_miss.value, EventType.violation.value}:
+        return Severity.low.value
+    return Severity.unknown.value
+
+
+def infer_claim_event_type(statement: str, fallback_overall: str) -> str:
+
+    text = statement.lower()
+    if any(_contains_keyword(text, token) for token in ("collision", "crash", "impact", "hit")):
+        return EventType.collision.value
+    if any(
+        _contains_keyword(text, token)
+        for token in (
+            "obstruction",
+            "obstructing",
+            "obstructed",
+            "obstruct",
+            "blockage",
+            "blocked",
+            "lane blocked",
+            "debris",
+        )
+    ):
+        return EventType.obstruction.value
+    if any(_contains_keyword(text, token) for token in ("near miss", "near_miss", "almost", "close call")):
+        return EventType.near_miss.value
+    if any(_contains_keyword(text, token) for token in ("red light", "illegal", "wrong-way", "wrong way", "violation")):
+        return EventType.violation.value
+    return fallback_overall
+
+
+def _parse_evidence_frame_ids(keyframes: list[str]) -> list[int]:
+    frame_ids: list[int] = []
+    for keyframe in keyframes:
+        filename = Path(keyframe).name
+        match = _FRAME_ID_PATTERN.search(filename)
+        if not match:
+            continue
+        frame_ids.append(int(match.group(1)))
+
+    unique_sorted = sorted(set(frame_ids))
+    return unique_sorted
+
+
+def _to_event_type(value: str) -> EventType:
+    try:
+        return EventType(value)
+    except ValueError:
+        return EventType.none
+
+
+def _to_severity(value: str) -> Severity:
+    try:
+        return Severity(value)
+    except ValueError:
+        return Severity.unknown
+
+
+def _normalize_claim_statement(statement: str, claim_event: EventType, confidence: float) -> str:
+
+    clean = " ".join(str(statement).strip().split())
+    if claim_event != EventType.collision or confidence < 0.9:
+        if clean and not clean.endswith((".", "!", "?")):
+            clean = f"{clean}."
+        return clean
+
+    replacements: tuple[tuple[str, str], ...] = (
+        (r"\bcollision risk or an actual collision\b", "collision"),
+        (r"\brisk or an actual collision\b", "collision"),
+        (r"\ba collision risk\b", "a collision"),
+        (r"\bpossible collision\b", "collision"),
+        (r"\bpotential collision\b", "collision"),
+        (r"\bmight collide\b", "collides"),
+        (r"\bmay collide\b", "collides"),
+    )
+    normalized = clean
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r",?\s*(indicating|suggesting)\s+(a\s+)?collision(\s+risk)?\.?",
+        ".",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        r"\b(appears to|seems to|may|might|could|possibly|potentially|likely)\s+",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"\s*,\s*", ", ", normalized)
+                                                                                        
+    normalized = re.sub(r"(?<!\d)\s*\.\s*(?!\d)", ". ", normalized)
+    normalized = re.sub(r"\s{2,}", " ", normalized).strip()
+    if normalized and not normalized.endswith((".", "!", "?")):
+        normalized = f"{normalized}."
+    return normalized
+
+
+def _add_segment_timing_context(statement: str, start_sec: float, end_sec: float) -> str:
+
+    clean = " ".join(str(statement).strip().split())
+    if not clean:
+        return clean
+                                                                             
+    existing_timing = re.search(
+        r"\bbetween\s+\d+\s*(?:\.\s*\d+)?s\s+and\s+\d+\s*(?:\.\s*\d+)?s\b",
+        clean,
+        flags=re.IGNORECASE,
+    )
+    if existing_timing is not None:
+        return clean
+    prefix = f"Between {start_sec:.2f}s and {end_sec:.2f}s, "
+    first = clean[0].lower() + clean[1:] if len(clean) > 1 else clean.lower()
+    combined = f"{prefix}{first}"
+    combined = re.sub(r"\s{2,}", " ", combined).strip()
+    if combined and not combined.endswith((".", "!", "?")):
+        combined = f"{combined}."
+    return combined
+
+
+def _evenly_spaced_paths(paths: list[str], max_frames: int) -> list[str]:
+    if max_frames <= 0 or len(paths) <= max_frames:
+        return paths[:]
+    if max_frames == 1:
+        return [paths[0]]
+    n = len(paths)
+    out: list[str] = []
+    for i in range(max_frames):
+        idx = int(round(i * (n - 1) / (max_frames - 1)))
+        out.append(paths[idx])
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in out:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _build_claim_writer_prompt(
+    claims: list[Claim],
+    perception: dict[str, Any],
+    start_sec: float,
+    end_sec: float,
+    event_type: EventType,
+) -> str:
+    claim_rows: list[str] = []
+    for claim in claims:
+        claim_rows.append(
+            f"- claim_id={claim.claim_id}, event_type={claim.event_type.value}, "
+            f"support_confidence={claim.support_confidence:.2f}, statement={claim.statement}"
+        )
+
+    conflicts = perception.get("potential_conflicts", [])
+    conflict_rows: list[str] = []
+    if isinstance(conflicts, list):
+        for item in conflicts[:6]:
+            if not isinstance(item, dict):
+                continue
+            conflict_rows.append(
+                f"- type={item.get('type', 'unknown')}, confidence={_clamp_confidence(item.get('confidence')):.2f}, "
+                f"description={item.get('description', '')}"
+            )
+
+    scene = perception.get("scene_conditions", {})
+    scene_text = json.dumps(scene) if isinstance(scene, dict) else "{}"
+
+    return (
+        "Rewrite each claim statement for incident reporting quality.\n"
+        "Requirements:\n"
+        "1) Keep factual and concise (1-2 sentences per claim).\n"
+        "2) Include timing using the provided segment window.\n"
+        "3) Explain mechanism/context (who moved from where/how conflict happened).\n"
+        "4) No speculation words: may, might, possibly, likely, potential, appears.\n"
+        "5) Keep event type aligned with claim event_type.\n"
+        "Return JSON only with shape:\n"
+        "{\"claims\":[{\"claim_id\":\"clm_001\",\"statement\":\"...\"}]}\n\n"
+        f"segment_window_sec: [{start_sec:.2f}, {end_sec:.2f}]\n"
+        f"overall_event_type: {event_type.value}\n"
+        f"scene_conditions: {scene_text}\n"
+        "perception_conflicts:\n"
+        + ("\n".join(conflict_rows) if conflict_rows else "- none")
+        + "\nclaims_to_rewrite:\n"
+        + "\n".join(claim_rows)
+    )
+
+
+def _enhance_claims_with_ai(
+    claims: list[Claim],
+    perception: dict[str, Any],
+    keyframes: list[str],
+    start_sec: float,
+    end_sec: float,
+    event_type: EventType,
+    model: str,
+    max_frames: int,
+    max_retries: int,
+) -> tuple[list[Claim], str | None]:
+    if not claims:
+        return (claims, None)
+
+    existing_keyframes = [path for path in keyframes if Path(path).exists()]
+    chosen_frames = _evenly_spaced_paths(existing_keyframes, max(2, int(max_frames)))
+    if not chosen_frames:
+        return (claims, "claim_writer_skipped_no_keyframes")
+
+    try:
+        client = OpenAIResponsesClient.from_env()
+    except Exception:
+        return (claims, "claim_writer_skipped_missing_api_key")
+
+    prompt = _build_claim_writer_prompt(
+        claims=claims,
+        perception=perception,
+        start_sec=start_sec,
+        end_sec=end_sec,
+        event_type=event_type,
+    )
+
+    try:
+        payload = client.respond_json_with_images(
+            model=model,
+            prompt_text=prompt,
+            image_paths=chosen_frames,
+            max_retries=max_retries,
+        )
+    except Exception:
+        return (claims, "claim_writer_failed")
+
+    rows = payload.get("claims", [])
+    if not isinstance(rows, list):
+        return (claims, "claim_writer_invalid_output")
+
+    rewritten_by_id: dict[str, str] = {}
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        claim_id = str(item.get("claim_id", "")).strip()
+        statement = " ".join(str(item.get("statement", "")).strip().split())
+        if claim_id and statement:
+            rewritten_by_id[claim_id] = statement
+
+    if not rewritten_by_id:
+        return (claims, "claim_writer_empty_output")
+
+    enhanced: list[Claim] = []
+    for claim in claims:
+        rewritten = rewritten_by_id.get(claim.claim_id, claim.statement)
+        normalized = _normalize_claim_statement(rewritten, claim.event_type, claim.support_confidence)
+        normalized = _add_segment_timing_context(normalized, start_sec, end_sec)
+        flags = [flag for flag in claim.uncertainty_flags if flag != "speculative_language"]
+        lowered = normalized.lower()
+        if any(token in lowered for token in _SPECULATIVE_TOKENS):
+            if not (claim.event_type == EventType.collision and claim.support_confidence >= 0.9):
+                flags.append("speculative_language")
+        deduped_flags = sorted(set(flags))
+        enhanced.append(claim.model_copy(update={"statement": normalized, "uncertainty_flags": deduped_flags}))
+
+    return (enhanced, None)
+
+
+def build_claims(
+    perception: dict[str, Any],
+    keyframes: list[str],
+    start_sec: float,
+    end_sec: float,
+) -> list[Claim]:
+
+    conflicts = perception.get("potential_conflicts", [])
+    if not isinstance(conflicts, list):
+        return []
+
+    evidence_frames = _parse_evidence_frame_ids(keyframes)
+    if not evidence_frames:
+        evidence_frames = [0]
+
+    _ = (start_sec, end_sec)
+    fallback_overall = infer_event_type(perception)
+    fallback_severity = _to_severity(infer_severity(perception))
+
+    claims: list[Claim] = []
+    for idx, item in enumerate(conflicts, start=1):
+        if not isinstance(item, dict):
+            continue
+        conflict_description = str(item.get("description", "")).strip()
+        conflict_type = str(item.get("type", "unknown")).strip().lower()
+        statement = conflict_description if conflict_description else f"Observed potential {conflict_type}."
+        inference_text = f"{conflict_type} {statement}".strip()
+        claim_event = _to_event_type(infer_claim_event_type(inference_text, fallback_overall))
+
+        confidence = _clamp_confidence(item.get("confidence"))
+        statement = _normalize_claim_statement(statement, claim_event, confidence)
+        statement = _add_segment_timing_context(statement, start_sec, end_sec)
+        statement_lower = statement.lower()
+
+        uncertainty_flags: list[str] = []
+        if confidence < 0.7:
+            uncertainty_flags.append("low_confidence")
+        has_speculative = any(token in statement_lower for token in _SPECULATIVE_TOKENS)
+        suppress_speculative = claim_event == EventType.collision and confidence >= 0.9
+        if has_speculative and not suppress_speculative:
+            uncertainty_flags.append("speculative_language")
+
+        claims.append(
+            Claim(
+                claim_id=f"clm_{idx:03d}",
+                event_type=claim_event,
+                severity=fallback_severity,
+                statement=statement,
+                support_confidence=confidence,
+                evidence_frames=evidence_frames,
+                uncertainty_flags=uncertainty_flags,
+            )
+        )
+
+    return claims
+
+
+def _build_summary(event_type: EventType, severity: Severity, start_sec: float, end_sec: float) -> str:
+    event_label = event_type.value.replace("_", " ")
+    return (
+        f"{event_label.capitalize()} observed from {start_sec:.2f}s to {end_sec:.2f}s. "
+        f"Estimated severity: {severity.value}."
+    )
+
+
+def build_incident_report(
+    perception_result_item: dict[str, Any],
+    source_video: str | Path,
+    fps: float = 2.0,
+    track_segment_summary: dict[str, Any] | None = None,
+    track_source: str | None = None,
+    enhance_claims_with_ai: bool = False,
+    claim_writer_model: str = "gpt-4.1",
+    claim_writer_max_frames: int = 8,
+    claim_writer_max_retries: int = 2,
+    require_ai_claims: bool = False,
+) -> IncidentReport:
+
+    _ = fps                                                                    
+    source_video_str = str(source_video)
+
+    segment_id = str(perception_result_item.get("segment_id", "unknown_segment"))
+    start_sec = float(perception_result_item.get("start_sec", 0.0))
+    end_sec = float(perception_result_item.get("end_sec", max(start_sec, 0.0)))
+    if end_sec < start_sec:
+        start_sec, end_sec = end_sec, start_sec
+
+    keyframes_raw = perception_result_item.get("keyframes", [])
+    keyframes = [str(item) for item in keyframes_raw] if isinstance(keyframes_raw, list) else []
+
+    perception_raw = perception_result_item.get("perception", {})
+    perception = perception_raw if isinstance(perception_raw, dict) else {}
+
+    event_type = _to_event_type(infer_event_type(perception))
+    severity = _to_severity(infer_severity(perception))
+    claims = build_claims(perception, keyframes, start_sec, end_sec)
+    claim_writer_note: str | None = None
+    if enhance_claims_with_ai:
+        claims, claim_writer_note = _enhance_claims_with_ai(
+            claims=claims,
+            perception=perception,
+            keyframes=keyframes,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            event_type=event_type,
+            model=claim_writer_model,
+            max_frames=claim_writer_max_frames,
+            max_retries=claim_writer_max_retries,
+        )
+        if require_ai_claims and claim_writer_note is not None:
+            raise ValueError(f"AI claim writer did not complete successfully: {claim_writer_note}")
+
+    evidence_frames = _parse_evidence_frame_ids(keyframes)
+    if not evidence_frames:
+        evidence_frames = [max(0, int(round(start_sec * 2.0)))]
+
+    conflicts = perception.get("potential_conflicts", [])
+    visible_actors = perception.get("visible_actors", [])
+    confidences: list[float] = []
+
+    if isinstance(conflicts, list):
+        for item in conflicts:
+            if isinstance(item, dict):
+                confidences.append(_clamp_confidence(item.get("confidence")))
+    if isinstance(visible_actors, list):
+        for item in visible_actors:
+            if isinstance(item, dict):
+                confidences.append(_clamp_confidence(item.get("confidence")))
+
+    segment_confidence = max(confidences) if confidences else 0.0
+    low_conf_exists = any(conf < 0.7 for conf in confidences)
+    review_required = event_type in {EventType.collision, EventType.near_miss} or low_conf_exists
+
+    uncertainty_flag_set: set[str] = set()
+    scene = perception.get("scene_conditions", {})
+    if isinstance(scene, dict):
+        weather = str(scene.get("weather", "unknown")).lower()
+        lighting = str(scene.get("lighting", "unknown")).lower()
+        if weather in {"fog", "rain", "snow", "unknown"} or lighting in {"night", "dawn_dusk", "tunnel", "unknown"}:
+            uncertainty_flag_set.add("low_visibility")
+
+    actors: list[Actor] = []
+    actor_roles: list[str] = []
+    confident_identified = False
+
+    track_class_hints: list[str] = []
+    if isinstance(track_segment_summary, dict):
+        class_counts = track_segment_summary.get("class_counts", {})
+        if isinstance(class_counts, dict):
+            track_class_hints = sorted(
+                (str(name) for name in class_counts.keys()),
+                key=lambda name: int(class_counts.get(name, 0)),
+                reverse=True,
+            )
+
+    if isinstance(visible_actors, list):
+        seen_actor_keys: set[tuple[str, str]] = set()
+        for idx, actor in enumerate(visible_actors, start=1):
+            if not isinstance(actor, dict):
+                continue
+            role = map_actor_role(actor)
+            if role == "unknown" and track_class_hints:
+                role = assign_actor_roles_from_tracks(track_class_hints[0])
+            if role not in _ROLE_SET:
+                role = "unknown"
+            confidence = _clamp_confidence(actor.get("confidence"))
+            description = _compact_actor_description(
+                raw_description=str(actor.get("description", "")),
+                role=role,
+                confidence=confidence,
+            )
+            key = (role, description)
+            if key in seen_actor_keys:
+                continue
+            seen_actor_keys.add(key)
+            actors.append(Actor(actor_id=f"a{idx}", role=role, description=description))
+            actor_roles.append(role)
+            if role != "unknown" and confidence >= 0.7:
+                confident_identified = True
+
+                                                                                              
+    if not actors and isinstance(track_segment_summary, dict):
+        track_rows = track_segment_summary.get("tracks", [])
+        if isinstance(track_rows, list):
+            for track in track_rows[:3]:
+                if not isinstance(track, dict):
+                    continue
+                track_id = track.get("track_id")
+                class_name = str(track.get("class_name", "unknown")).strip().lower()
+                num_boxes = int(track.get("num_boxes", 0)) if str(track.get("num_boxes", "")).strip() else 0
+                role = assign_actor_roles_from_tracks(class_name)
+                if role not in _ROLE_SET:
+                    role = "unknown"
+                description = f"Tracked {class_name} participant (track_id={track_id}, boxes={num_boxes})."
+                actors.append(Actor(actor_id=f"a{len(actors) + 1}", role=role, description=description))
+                actor_roles.append(role)
+                if role != "unknown" and num_boxes > 0:
+                    confident_identified = True
+
+    if not actor_roles or any(role == "unknown" for role in actor_roles):
+        uncertainty_flag_set.add("actor_type_ambiguous")
+    if not confident_identified:
+        uncertainty_flag_set.add("limited_scene_evidence")
+
+    for claim in claims:
+        for flag in claim.uncertainty_flags:
+            uncertainty_flag_set.add(flag)
+
+    uncertainty_flags = sorted(uncertainty_flag_set)
+
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    report_id = build_report_id(Path(source_video_str).stem, segment_id, event_type.value)
+    model_name = str(
+        perception_result_item.get("model_name") or perception_result_item.get("model") or "unknown"
+    ).strip() or "unknown"
+
+    segment = Segment(
+        segment_id=segment_id,
+        start_sec=round(start_sec, 6),
+        end_sec=round(end_sec, 6),
+        segment_confidence=_clamp_confidence(segment_confidence),
+        evidence_frames=evidence_frames,
+        claims=claims,
+        uncertainty_flags=uncertainty_flags,
+    )
+
+    overall_assessment = OverallAssessment(
+        event_type=event_type,
+        severity=severity,
+        review_required=review_required,
+        summary=_build_summary(event_type, severity, start_sec, end_sec),
+        uncertainty_flags=uncertainty_flags,
+    )
+
+    notes = f"model_name={model_name};prompt_version=v1;parser_version=v1"
+    if track_source:
+        notes = f"{notes};track_source={track_source}"
+    if enhance_claims_with_ai:
+        notes = f"{notes};claim_writer_model={claim_writer_model}"
+    if claim_writer_note:
+        notes = f"{notes};{claim_writer_note}"
+    if uncertainty_flags:
+        notes = f"{notes};flags={','.join(uncertainty_flags)}"
+
+    audit = Audit(
+        validator_version="v1",
+        review_required=review_required,
+        uncertainty_flags=uncertainty_flags,
+        notes=notes,
+    )
+
+    report = IncidentReport(
+        meta=Meta(
+            report_id=report_id,
+            source_video=source_video_str,
+            created_at=generated_at,
+            schema_version="1.0",
+        ),
+        actors=actors,
+        segments=[segment],
+        overall_assessment=overall_assessment,
+        audit=audit,
+    )
+    return report
+
+
+def save_report_json(report: IncidentReport, out_path: str | Path) -> None:
+
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(report.model_dump_json(indent=2), encoding="utf-8")

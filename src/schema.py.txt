@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+from enum import Enum
+from typing import List
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+
+class StrictBaseModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class EventType(str, Enum):
+    collision = "collision"
+    near_miss = "near_miss"
+    obstruction = "obstruction"
+    violation = "violation"
+    none = "none"
+
+
+class Severity(str, Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+    unknown = "unknown"
+
+
+class Meta(StrictBaseModel):
+    report_id: str
+    source_video: str
+    created_at: str
+    schema_version: str = "1.0"
+
+
+class Actor(StrictBaseModel):
+    actor_id: str
+    role: str
+    description: str | None = None
+
+
+class Claim(StrictBaseModel):
+    claim_id: str
+    event_type: EventType
+    severity: Severity
+    statement: str
+    support_confidence: float = Field(ge=0.0, le=1.0)
+    evidence_frames: List[int] = Field(min_length=1)
+    uncertainty_flags: List[str] = Field(default_factory=list)
+
+
+class Segment(StrictBaseModel):
+    segment_id: str
+    start_sec: float = Field(ge=0.0)
+    end_sec: float = Field(ge=0.0)
+    segment_confidence: float = Field(ge=0.0, le=1.0)
+    evidence_frames: List[int] = Field(min_length=1)
+    claims: List[Claim] = Field(default_factory=list)
+    uncertainty_flags: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "Segment":
+        if self.start_sec > self.end_sec:
+            raise ValueError("start_sec must be less than or equal to end_sec")
+        return self
+
+
+class OverallAssessment(StrictBaseModel):
+    event_type: EventType
+    severity: Severity
+    review_required: bool
+    summary: str
+    uncertainty_flags: List[str] = Field(default_factory=list)
+
+
+class Audit(StrictBaseModel):
+    validator_version: str
+    review_required: bool
+    uncertainty_flags: List[str] = Field(default_factory=list)
+    notes: str | None = None
+
+
+class IncidentReport(StrictBaseModel):
+    meta: Meta
+    actors: List[Actor] = Field(default_factory=list)
+    segments: List[Segment] = Field(min_length=1)
+    overall_assessment: OverallAssessment
+    audit: Audit
+
+
+def parse_report_json(raw_json: str) -> IncidentReport:
+    try:
+        return IncidentReport.model_validate_json(raw_json)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid incident report payload:\n{exc}") from exc

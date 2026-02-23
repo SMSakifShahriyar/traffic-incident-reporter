@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import time
+from pathlib import Path
+from typing import Any
+from urllib import error, request
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    try:
+        loaded = json.loads(stripped)
+        if isinstance(loaded, dict):
+            return loaded
+    except json.JSONDecodeError:
+        pass
+
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("Model response did not contain a valid JSON object")
+
+    candidate = stripped[start : end + 1]
+    loaded = json.loads(candidate)
+    if not isinstance(loaded, dict):
+        raise ValueError("Model response JSON must be an object")
+    return loaded
+
+
+def _extract_output_text(payload: dict[str, Any]) -> str:
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    output = payload.get("output")
+    if isinstance(output, list):
+        chunks: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("text")
+                if isinstance(text, str):
+                    chunks.append(text)
+        if chunks:
+            return "\n".join(chunks)
+
+    raise ValueError("Could not extract text from OpenAI Responses API payload")
+
+
+def _image_to_data_url(image_path: str | Path) -> str:
+    path = Path(image_path)
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"Image not found: {path}")
+
+    suffix = path.suffix.lower()
+    mime = "image/jpeg"
+    if suffix == ".png":
+        mime = "image/png"
+    elif suffix in {".jpg", ".jpeg"}:
+        mime = "image/jpeg"
+
+    raw = path.read_bytes()
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+class OpenAIResponsesClient:
+
+    def __init__(self, api_key: str, base_url: str = "https://api.openai.com/v1/responses") -> None:
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is missing")
+        self.api_key = api_key
+        self.base_url = base_url
+
+    @classmethod
+    def from_env(cls) -> "OpenAIResponsesClient":
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is missing. Set it in your environment before running perceive.")
+        return cls(api_key=api_key)
+
+    def respond_json_with_images(
+        self,
+        model: str,
+        prompt_text: str,
+        image_paths: list[str],
+        max_retries: int = 2,
+    ) -> dict[str, Any]:
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt_text}]
+        for image_path in image_paths:
+            content.append({"type": "input_image", "image_url": _image_to_data_url(image_path)})
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": [{"role": "user", "content": content}],
+            "text": {"format": {"type": "json_object"}},
+        }
+
+        attempts = max(0, max_retries) + 1
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                req = request.Request(
+                    self.base_url,
+                    method="POST",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    data=json.dumps(payload).encode("utf-8"),
+                )
+                with request.urlopen(req, timeout=90) as response:
+                    body = response.read().decode("utf-8")
+                parsed = json.loads(body)
+                text = _extract_output_text(parsed)
+                return _extract_json_object(text)
+            except (error.URLError, error.HTTPError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                time.sleep(1.0 * attempt)
+
+        raise RuntimeError(f"OpenAI request failed after {attempts} attempts: {last_error}")
+
+    def perceive_with_images(
+        self,
+        model: str,
+        prompt_text: str,
+        image_paths: list[str],
+        max_retries: int = 2,
+    ) -> dict[str, Any]:
+
+        return self.respond_json_with_images(
+            model=model,
+            prompt_text=prompt_text,
+            image_paths=image_paths,
+            max_retries=max_retries,
+        )

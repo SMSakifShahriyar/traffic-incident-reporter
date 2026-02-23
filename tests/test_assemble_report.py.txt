@@ -1,0 +1,369 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+import pytest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.assemble import (
+    build_claims,
+    build_incident_report,
+    build_report_id,
+    build_report_filename,
+    infer_claim_event_type,
+    map_actor_role,
+)
+from src.schema import IncidentReport
+
+
+def test_build_incident_report_collision_validates() -> None:
+    perception_item = {
+        "segment_id": "s1",
+        "start_sec": 3.0,
+        "end_sec": 7.0,
+        "keyframes": [
+            "data/frame_cache/demo/f_000012.jpg",
+            "data/frame_cache/demo/f_000016.jpg",
+        ],
+        "perception": {
+            "visible_actors": [
+                {"type": "vehicle", "confidence": 0.9, "description": "White sedan"},
+                {"type": "truck", "confidence": 0.82, "description": "Delivery truck"},
+            ],
+            "scene_conditions": {
+                "weather": "clear",
+                "lighting": "day",
+                "road_surface": "dry",
+            },
+            "potential_conflicts": [
+                {
+                    "type": "collision_risk",
+                    "confidence": 0.91,
+                    "description": "Truck impacted lane with sedan while causing lane blockage.",
+                }
+            ],
+            "notes": "Observed lane blockage after impact.",
+        },
+        "status": "ok",
+        "error": None,
+        "model": "gpt-4.1-mini",
+    }
+
+    report = build_incident_report(
+        perception_result_item=perception_item,
+        source_video="data/raw_videos/cctv_006.mp4",
+        fps=2.0,
+    )
+
+    assert report.overall_assessment.event_type.value in {"collision", "near_miss", "obstruction", "violation", "none"}
+    assert report.overall_assessment.severity.value in {"low", "medium", "high", "unknown"}
+    assert report.segments[0].claims
+    assert report.segments[0].claims[0].evidence_frames
+
+    validated = IncidentReport.model_validate(report.model_dump())
+    assert validated.overall_assessment.event_type.value == "collision"
+    assert validated.overall_assessment.severity.value in {"high", "medium"}
+
+
+def test_actor_role_mapping_ambiguous_vehicle_to_unknown() -> None:
+    role = map_actor_role({"type": "vehicle", "description": "dark moving object"})
+    assert role == "unknown"
+
+
+def test_claim_event_type_mixed_collision_and_obstruction() -> None:
+    perception = {
+        "potential_conflicts": [
+            {"type": "risk", "confidence": 0.9, "description": "Vehicle collision after impact at junction."},
+            {"type": "risk", "confidence": 0.8, "description": "Lane blocked by debris causing obstruction."},
+        ]
+    }
+    claims = build_claims(
+        perception=perception,
+        keyframes=["data/frame_cache/demo/f_000002.jpg", "data/frame_cache/demo/f_000004.jpg"],
+        start_sec=1.0,
+        end_sec=4.0,
+    )
+
+    event_types = {claim.event_type.value for claim in claims}
+    assert "collision" in event_types
+    assert "obstruction" in event_types
+
+
+def test_uncertainty_flags_added_for_low_confidence_and_ambiguous_actor() -> None:
+    perception_item = {
+        "segment_id": "s2",
+        "start_sec": 1.0,
+        "end_sec": 3.0,
+        "keyframes": ["data/frame_cache/demo/f_000001.jpg"],
+        "perception": {
+            "visible_actors": [
+                {"type": "vehicle", "confidence": 0.45, "description": "unclear silhouette"},
+            ],
+            "scene_conditions": {"weather": "clear", "lighting": "day", "road_surface": "dry"},
+            "potential_conflicts": [
+                {
+                    "type": "risk",
+                    "confidence": 0.4,
+                    "description": "This may be a near miss and appears uncertain.",
+                }
+            ],
+            "notes": "",
+        },
+        "model": "gpt-4.1-mini",
+    }
+
+    report = build_incident_report(perception_item, source_video="data/raw_videos/demo.mp4")
+
+    claim_flags = set(report.segments[0].claims[0].uncertainty_flags)
+    assert "low_confidence" in claim_flags
+    assert "speculative_language" in claim_flags
+
+    segment_flags = set(report.segments[0].uncertainty_flags)
+    overall_flags = set(report.overall_assessment.uncertainty_flags)
+    assert "actor_type_ambiguous" in segment_flags
+    assert "actor_type_ambiguous" in overall_flags
+    assert "limited_scene_evidence" in segment_flags
+
+    assert report.audit.notes is not None
+    assert "flags=" in report.audit.notes
+    assert "actor_type_ambiguous" in report.audit.notes
+    assert "low_confidence" in report.audit.notes
+
+
+def test_filename_dedup_no_collision_collision() -> None:
+    filename = build_report_filename("cctv_006", "s_collision", "collision")
+    assert filename == "cctv_006_s_collision_report.json"
+
+
+def test_report_id_dedup_no_collision_collision() -> None:
+    report_id = build_report_id("cctv_006", "s_collision", "collision")
+    assert report_id == "cctv_006_s_collision"
+
+
+def test_claim_speculative_flag_for_risk_language() -> None:
+    claims = build_claims(
+        perception={
+            "potential_conflicts": [
+                {
+                    "type": "collision_risk",
+                    "confidence": 0.55,
+                    "description": "Possible collision risk or actual impact remains unclear.",
+                }
+            ]
+        },
+        keyframes=["data/frame_cache/demo/f_000008.jpg"],
+        start_sec=4.0,
+        end_sec=10.0,
+    )
+    assert claims
+    assert "speculative_language" in set(claims[0].uncertainty_flags)
+
+
+def test_high_conf_collision_statement_dehedged() -> None:
+    claims = build_claims(
+        perception={
+            "potential_conflicts": [
+                {
+                    "type": "collision_risk",
+                    "confidence": 0.95,
+                    "description": "The white car collides with the silver car, indicating a collision risk or an actual collision.",
+                }
+            ]
+        },
+        keyframes=["data/frame_cache/demo/f_000008.jpg"],
+        start_sec=4.0,
+        end_sec=10.0,
+    )
+    assert claims
+    text = claims[0].statement.lower()
+    assert "risk or an actual collision" not in text
+    assert "indicating a collision" not in text
+    assert "between 4.00s and 10.00s" in text
+    assert "speculative_language" not in set(claims[0].uncertainty_flags)
+
+
+def test_high_conf_collision_statement_removes_modal_language() -> None:
+    claims = build_claims(
+        perception={
+            "potential_conflicts": [
+                {
+                    "type": "collision_risk",
+                    "confidence": 0.92,
+                    "description": "The white car may collide with the silver car and could cause impact.",
+                }
+            ]
+        },
+        keyframes=["data/frame_cache/demo/f_000010.jpg"],
+        start_sec=4.0,
+        end_sec=10.0,
+    )
+    assert claims
+    text = claims[0].statement.lower()
+    assert " may " not in f" {text} "
+    assert " could " not in f" {text} "
+    assert text.endswith(".")
+
+
+def test_existing_between_timing_not_duplicated_and_decimal_preserved() -> None:
+    claims = build_claims(
+        perception={
+            "potential_conflicts": [
+                {
+                    "type": "obstruction",
+                    "confidence": 0.9,
+                    "description": "Between 8.50s and 10.50s, a white sedan remained stationary near the curb.",
+                }
+            ]
+        },
+        keyframes=["data/frame_cache/demo/f_000017.jpg"],
+        start_sec=8.5,
+        end_sec=10.5,
+    )
+    assert claims
+    text = claims[0].statement
+    assert text.lower().count("between") == 1
+    assert "8.50s" in text
+    assert "8. 50s" not in text
+
+
+def test_infer_claim_event_type_does_not_match_hit_inside_white() -> None:
+    text = "obstruction white sedan with front damage is stationary near the sidewalk obstructing traffic."
+    assert infer_claim_event_type(text, "collision") == "obstruction"
+
+
+def test_actor_list_prefers_perception_participants_over_track_rows() -> None:
+    perception_item = {
+        "segment_id": "s1",
+        "start_sec": 3.0,
+        "end_sec": 7.0,
+        "keyframes": ["data/frame_cache/demo/f_000012.jpg"],
+        "perception": {
+            "visible_actors": [
+                {
+                    "type": "vehicle",
+                    "confidence": 0.9,
+                    "description": "Several cars visible on the road, including a silver car entering from a side street.",
+                }
+            ],
+            "scene_conditions": {"weather": "clear", "lighting": "day", "road_surface": "dry"},
+            "potential_conflicts": [
+                {"type": "collision", "confidence": 0.9, "description": "Collision observed."}
+            ],
+            "notes": "",
+        },
+        "status": "ok",
+        "error": None,
+    }
+    track_segment_summary = {
+        "class_counts": {"car": 10},
+        "tracks": [
+            {"track_id": 100, "class_name": "car", "num_boxes": 181},
+            {"track_id": 118, "class_name": "car", "num_boxes": 165},
+        ],
+    }
+
+    report = build_incident_report(
+        perception_result_item=perception_item,
+        source_video="data/raw_videos/cctv_006.mp4",
+        track_segment_summary=track_segment_summary,
+    )
+
+    assert report.actors
+    descriptions = [str(actor.description or "") for actor in report.actors]
+    assert all("track_id=" not in desc for desc in descriptions)
+    assert all(actor.role == "car" for actor in report.actors)
+
+
+def test_build_incident_report_claim_writer_ai_rewrites_statement(monkeypatch, tmp_path: Path) -> None:
+    k1 = tmp_path / "f_000008.jpg"
+    k2 = tmp_path / "f_000010.jpg"
+    k1.write_bytes(b"x")
+    k2.write_bytes(b"y")
+
+    perception_item = {
+        "segment_id": "s_collision",
+        "start_sec": 4.0,
+        "end_sec": 10.0,
+        "keyframes": [str(k1), str(k2)],
+        "perception": {
+            "visible_actors": [{"type": "car", "confidence": 0.9, "description": "car"}],
+            "scene_conditions": {"weather": "clear", "lighting": "day", "road_surface": "dry"},
+            "potential_conflicts": [
+                {
+                    "type": "collision",
+                    "confidence": 0.95,
+                    "description": "The white car collides with the silver car.",
+                }
+            ],
+            "notes": "",
+        },
+        "status": "ok",
+        "error": None,
+    }
+
+    class _FakeClient:
+        def respond_json_with_images(self, **_kwargs):
+            return {
+                "claims": [
+                    {
+                        "claim_id": "clm_001",
+                        "statement": (
+                            "At approximately 6.5s, a white sedan exits the side street and strikes "
+                            "a silver sedan traveling on the main road, causing immediate lateral disruption."
+                        ),
+                    }
+                ]
+            }
+
+    monkeypatch.setattr("src.assemble.OpenAIResponsesClient.from_env", lambda: _FakeClient())
+
+    report = build_incident_report(
+        perception_result_item=perception_item,
+        source_video="data/raw_videos/cctv_006.mp4",
+        enhance_claims_with_ai=True,
+        claim_writer_model="gpt-4.1-mini",
+        claim_writer_max_frames=8,
+        claim_writer_max_retries=1,
+    )
+
+    claim_text = report.segments[0].claims[0].statement.lower()
+    assert "between 4.00s and 10.00s" in claim_text
+    assert "strikes" in claim_text
+    assert report.audit.notes is not None
+    assert "claim_writer_model=gpt-4.1-mini" in report.audit.notes
+
+
+def test_build_incident_report_claim_writer_required_raises_on_skip(monkeypatch, tmp_path: Path) -> None:
+    k1 = tmp_path / "f_000008.jpg"
+    k1.write_bytes(b"x")
+    perception_item = {
+        "segment_id": "s_collision",
+        "start_sec": 4.0,
+        "end_sec": 10.0,
+        "keyframes": [str(k1)],
+        "perception": {
+            "visible_actors": [{"type": "car", "confidence": 0.9, "description": "car"}],
+            "scene_conditions": {"weather": "clear", "lighting": "day", "road_surface": "dry"},
+            "potential_conflicts": [
+                {"type": "collision", "confidence": 0.95, "description": "Collision observed."}
+            ],
+            "notes": "",
+        },
+    }
+
+    monkeypatch.setattr(
+        "src.assemble.OpenAIResponsesClient.from_env",
+        lambda: (_ for _ in ()).throw(ValueError("OPENAI_API_KEY is missing")),
+    )
+
+    with pytest.raises(ValueError):
+        build_incident_report(
+            perception_result_item=perception_item,
+            source_video="data/raw_videos/cctv_006.mp4",
+            enhance_claims_with_ai=True,
+            require_ai_claims=True,
+        )

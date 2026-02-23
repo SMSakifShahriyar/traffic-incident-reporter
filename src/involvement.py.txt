@@ -1,0 +1,1375 @@
+from __future__ import annotations
+
+import json
+import math
+from itertools import combinations
+from datetime import datetime, timezone
+from hashlib import sha1
+from pathlib import Path
+from typing import Any
+
+from . import app_services as services
+from .openai_client import OpenAIResponsesClient
+
+
+DEFAULT_INVOLVEMENT_PROMPT = """
+You are selecting directly involved traffic participants for one incident claim.
+Use ONLY the provided keyframes and candidate track metadata.
+
+Rules:
+- Choose primary_track_ids from candidate IDs only.
+- Usually return 2 primary IDs for a collision claim.
+- If collision appears multi-stage, choose the earliest clear impact pair as primary,
+  and place later related participants in secondary_track_ids.
+- Put nearby/non-primary participants into secondary_track_ids.
+- If uncertain, return lower decision_confidence and add ambiguity_flags.
+- JSON only. No markdown.
+
+Return exactly:
+{
+  "primary_track_ids": [int, ...],
+  "secondary_track_ids": [int, ...],
+  "decision_confidence": 0.0,
+  "rationale": "",
+  "ambiguity_flags": ["", ...]
+}
+""".strip()
+
+
+_CLAIM_ID_NUM_PATTERN = r"^clm_(\d+)$"
+
+
+def _clamp(value: Any, low: float = 0.0, high: float = 1.0) -> float:
+    try:
+        x = float(value)
+    except Exception:
+        return low
+    if x < low:
+        return low
+    if x > high:
+        return high
+    return x
+
+
+def _dedupe_ints(values: Any, candidate_ids: set[int]) -> list[int]:
+    if not isinstance(values, list):
+        return []
+    out: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        try:
+            tid = int(value)
+        except Exception:
+            continue
+        if tid not in candidate_ids or tid in seen:
+            continue
+        seen.add(tid)
+        out.append(tid)
+    return out
+
+
+def _sample_evenly(paths: list[str], max_items: int) -> list[str]:
+    if max_items <= 0 or len(paths) <= max_items:
+        return paths[:]
+    if max_items == 1:
+        return [paths[0]]
+    n = len(paths)
+    result: list[str] = []
+    for i in range(max_items):
+        idx = int(round(i * (n - 1) / (max_items - 1)))
+        result.append(paths[idx])
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in result:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def normalize_involvement_response(
+    payload: dict[str, Any],
+    candidate_track_ids: list[int],
+    fallback_primary: list[int],
+) -> dict[str, Any]:
+    candidate_set = set(int(tid) for tid in candidate_track_ids)
+    primary = _dedupe_ints(payload.get("primary_track_ids", []), candidate_set)
+    secondary = _dedupe_ints(payload.get("secondary_track_ids", []), candidate_set)
+    secondary = [tid for tid in secondary if tid not in set(primary)]
+    if not primary:
+        primary = [int(tid) for tid in fallback_primary if int(tid) in candidate_set][:2]
+    if not primary:
+        primary = [int(tid) for tid in candidate_track_ids[:2]]
+    primary = primary[:2]
+
+    ambiguity_flags: list[str] = []
+    raw_flags = payload.get("ambiguity_flags", [])
+    if isinstance(raw_flags, list):
+        for item in raw_flags:
+            text = str(item).strip()
+            if text and text not in ambiguity_flags:
+                ambiguity_flags.append(text)
+
+    rationale = str(payload.get("rationale", "")).strip()
+    if not rationale:
+        rationale = "Heuristic fallback due to low-confidence or missing AI selection."
+
+    return {
+        "primary_track_ids": primary,
+        "secondary_track_ids": secondary,
+        "decision_confidence": _clamp(payload.get("decision_confidence", 0.0)),
+        "rationale": rationale,
+        "ambiguity_flags": ambiguity_flags,
+    }
+
+
+def _build_prompt(
+    claim: dict[str, Any],
+    track_evidence: dict[str, Any],
+    prompt_template: str,
+    anchor_track_ids: list[int] | None = None,
+    anchor_pair: list[int] | None = None,
+) -> str:
+    claim_id = str(claim.get("claim_id", "claim"))
+    statement = str(claim.get("statement", ""))
+    event_type = str(claim.get("event_type", "unknown"))
+    evidence_frames = claim.get("evidence_frames", [])
+    candidates = track_evidence.get("track_ids", [])
+    tracks = track_evidence.get("tracks", [])
+    pair_candidates = track_evidence.get("impact_pair_candidates", [])
+
+    track_lines: list[str] = []
+    if isinstance(tracks, list):
+        for row in tracks[:20]:
+            if not isinstance(row, dict):
+                continue
+            track_lines.append(
+                f"- id={int(row.get('track_id', -1))}, class={row.get('class_name', 'unknown')}, "
+                f"boxes={int(row.get('boxes', 0))}, max_conf={float(row.get('max_conf', 0.0)):.3f}"
+            )
+
+    pair_lines: list[str] = []
+    if isinstance(pair_candidates, list):
+        for item in pair_candidates[:5]:
+            if not isinstance(item, dict):
+                continue
+            pair = item.get("pair", [])
+            peak_ts = item.get("peak_timestamp_sec", None)
+            peak_score = item.get("peak_score", None)
+            pair_lines.append(
+                f"- pair={pair}, peak_ts={peak_ts}, peak_score={peak_score}, frames={item.get('frames', 0)}"
+            )
+
+    context = [
+        f"claim_id: {claim_id}",
+        f"event_type: {event_type}",
+        f"statement: {statement}",
+        f"evidence_frames: {evidence_frames}",
+        f"candidate_track_ids: {candidates}",
+        f"impact_anchor_track_ids: {anchor_track_ids or []}",
+        f"impact_anchor_pair_hint: {anchor_pair or []}",
+        "image_label_format: class#track_id conf",
+        "candidate_track_stats:",
+        *track_lines,
+        "impact_pair_candidates:",
+        *(pair_lines if pair_lines else ["- none"]),
+    ]
+    return f"{prompt_template}\n\nClaim Context:\n" + "\n".join(context)
+
+
+def _class_map_from_track_evidence(track_evidence: dict[str, Any]) -> dict[int, str]:
+    out: dict[int, str] = {}
+    rows = track_evidence.get("tracks", []) if isinstance(track_evidence, dict) else []
+    if not isinstance(rows, list):
+        return out
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        try:
+            tid = int(item.get("track_id", -1))
+        except Exception:
+            continue
+        if tid < 0:
+            continue
+        cls = str(item.get("class_name", "")).strip().lower() or "participant"
+        out[tid] = cls
+    return out
+
+
+def _label_track(track_id: int, class_map: dict[int, str]) -> str:
+    cls = class_map.get(int(track_id), "participant")
+    return f"track {int(track_id)} ({cls})"
+
+
+def _pair_peak_time(pair: list[int], pair_candidates: list[dict[str, Any]]) -> float | None:
+    if len(pair) != 2:
+        return None
+    a, b = sorted([int(pair[0]), int(pair[1])])
+    for item in pair_candidates:
+        if not isinstance(item, dict):
+            continue
+        raw_pair = item.get("pair", [])
+        if not isinstance(raw_pair, list) or len(raw_pair) != 2:
+            continue
+        x, y = sorted([int(raw_pair[0]), int(raw_pair[1])])
+        if x == a and y == b:
+            ts = item.get("peak_timestamp_sec")
+            if isinstance(ts, (int, float)):
+                return float(ts)
+    return None
+
+
+def _pair_strength(pair: list[int], pair_candidates: list[dict[str, Any]]) -> float:
+    if len(pair) != 2:
+        return 0.0
+    a, b = sorted([int(pair[0]), int(pair[1])])
+    best = 0.0
+    for item in pair_candidates:
+        if not isinstance(item, dict):
+            continue
+        raw_pair = item.get("pair", [])
+        if not isinstance(raw_pair, list) or len(raw_pair) != 2:
+            continue
+        x, y = sorted([int(raw_pair[0]), int(raw_pair[1])])
+        if x == a and y == b:
+            score = float(item.get("selection_score", item.get("peak_score", 0.0)))
+            if score > best:
+                best = score
+    return float(best)
+
+
+def _tokenize_for_filename(value: str) -> str:
+    raw = "".join(ch if ch.isalnum() else "_" for ch in str(value).strip().lower())
+    compact = "_".join(part for part in raw.split("_") if part)
+    return compact or "x"
+
+
+def _render_keyframes_for_involvement_ai(
+    keyframes: list[str],
+    claim_id: str,
+    segment_id: str,
+    frames_json_path: str | None,
+    video_path: str | None,
+    tracks_csv_path: str | None,
+) -> list[str]:
+
+    if not keyframes:
+        return []
+    if not tracks_csv_path or not Path(tracks_csv_path).exists():
+        return keyframes[:]
+
+    out_dir = Path("data") / "outputs" / "_rendered_frames" / "involvement_ai"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    seg_token = _tokenize_for_filename(segment_id)
+    claim_token = _tokenize_for_filename(claim_id)
+    tracks_token = str(Path(tracks_csv_path).resolve(strict=False))
+
+    rendered: list[str] = []
+    for image_path in keyframes:
+        src = Path(image_path)
+        timestamp_sec: float | None = None
+        try:
+            meta = services.resolve_keyframe_metadata(
+                keyframe_path=str(src),
+                frames_json_path=frames_json_path,
+                video_path=video_path,
+                fallback_fps=2.0,
+            )
+            ts = meta.get("timestamp_sec")
+            if isinstance(ts, (int, float)):
+                timestamp_sec = float(ts)
+        except Exception:
+            timestamp_sec = None
+
+        ts_text = f"{timestamp_sec:.3f}" if timestamp_sec is not None else "na"
+        digest = sha1(f"{src.resolve(strict=False)}|{ts_text}|{tracks_token}".encode("utf-8")).hexdigest()[:12]
+        out_path = out_dir / f"{src.stem}_{seg_token}_{claim_token}_{digest}.jpg"
+
+        if not out_path.exists():
+            try:
+                services.render_keyframe_with_tracks(
+                    keyframe_image_path=str(src),
+                    keyframe_timestamp_sec=timestamp_sec,
+                    tracks_csv_path=str(tracks_csv_path),
+                    out_path=str(out_path),
+                    video_path=video_path,
+                )
+            except Exception:
+                rendered.append(str(src))
+                continue
+
+        if out_path.exists():
+            rendered.append(str(out_path))
+        else:
+            rendered.append(str(src))
+
+    return rendered if rendered else keyframes[:]
+
+
+def _find_secondary_pair(
+    primary_pair: list[int],
+    pair_candidates: list[dict[str, Any]],
+    primary_ts: float | None,
+) -> tuple[list[int], float | None]:
+    if len(primary_pair) != 2:
+        return ([], None)
+    primary_set = {int(primary_pair[0]), int(primary_pair[1])}
+    best_pair: list[int] = []
+    best_ts: float | None = None
+    best_score = -1.0
+    for item in pair_candidates:
+        if not isinstance(item, dict):
+            continue
+        pair = item.get("pair", [])
+        if not isinstance(pair, list) or len(pair) != 2:
+            continue
+        pair_int = [int(pair[0]), int(pair[1])]
+        pair_set = {pair_int[0], pair_int[1]}
+        if pair_set == primary_set:
+            continue
+        if len(pair_set.intersection(primary_set)) != 1:
+            continue
+        ts_raw = item.get("peak_timestamp_sec")
+        ts = float(ts_raw) if isinstance(ts_raw, (int, float)) else None
+        if primary_ts is not None and ts is not None and ts < primary_ts + 0.15:
+            continue
+        score = float(item.get("selection_score", item.get("peak_score", 0.0)))
+        if score > best_score:
+            best_score = score
+            best_pair = pair_int
+            best_ts = ts
+    return (best_pair, best_ts)
+
+
+def _infer_id_switch_notes(
+    primary_pair: list[int],
+    pair_candidates: list[dict[str, Any]],
+    class_map: dict[int, str],
+    primary_ts: float | None,
+) -> list[str]:
+    if len(primary_pair) != 2:
+        return []
+    notes: list[str] = []
+    pset = {int(primary_pair[0]), int(primary_pair[1])}
+    pclass = {tid: class_map.get(tid, "participant") for tid in pset}
+    for item in pair_candidates:
+        if not isinstance(item, dict):
+            continue
+        pair = item.get("pair", [])
+        if not isinstance(pair, list) or len(pair) != 2:
+            continue
+        pair_int = [int(pair[0]), int(pair[1])]
+        pair_set = {pair_int[0], pair_int[1]}
+        if len(pair_set.intersection(pset)) != 1:
+            continue
+        shared = next(iter(pair_set.intersection(pset)))
+        other = next(iter(pair_set - {shared}))
+        replaced = next(iter(pset - {shared}))
+        if class_map.get(other, "participant") != pclass.get(replaced, "participant"):
+            continue
+        ts_raw = item.get("peak_timestamp_sec")
+        ts = float(ts_raw) if isinstance(ts_raw, (int, float)) else None
+        if primary_ts is None or ts is None:
+            continue
+                                                                                   
+        if ts >= primary_ts:
+            continue
+        if abs(ts - primary_ts) > 1.0:
+            continue
+        note = f"possible track-id continuity around impact: {other} -> {replaced}"
+        if note not in notes:
+            notes.append(note)
+    return notes
+
+
+def _movement_descriptor(dx: float, dy: float) -> str:
+    magnitude = math.hypot(dx, dy)
+    if magnitude < 15.0:
+        return "shows minimal displacement"
+
+    horiz = ""
+    if dx > 12.0:
+        horiz = "to the right"
+    elif dx < -12.0:
+        horiz = "to the left"
+
+    vertical_dominant = abs(dy) > abs(dx) * 1.25
+    if horiz and not vertical_dominant:
+        return f"moves {horiz} across the frame"
+    if horiz and vertical_dominant:
+        return "moves diagonally across the frame"
+    if vertical_dominant:
+        return "moves along the frame depth axis"
+    return "moves across the frame"
+
+
+def _track_motion_context(
+    tracks_csv_path: str | None,
+    primary_pair: list[int],
+    start_sec: float,
+    end_sec: float,
+    primary_ts: float | None,
+) -> tuple[dict[int, str], str | None]:
+
+    if not tracks_csv_path or len(primary_pair) != 2:
+        return ({}, None)
+
+    try:
+        df = services.load_tracks_csv(tracks_csv_path)
+    except Exception:
+        return ({}, None)
+
+    if df.empty:
+        return ({}, None)
+    required = {"track_id", "timestamp_sec", "x1", "y1", "x2", "y2"}
+    if not required.issubset(set(df.columns)):
+        return ({}, None)
+
+    track_set = {int(primary_pair[0]), int(primary_pair[1])}
+    ts_start = float(start_sec)
+    ts_end = float(end_sec)
+    if primary_ts is not None:
+        local_start = max(float(start_sec), float(primary_ts) - 1.2)
+        local_end = min(float(end_sec), float(primary_ts) + 1.2)
+        if local_end - local_start >= 0.3:
+            ts_start, ts_end = local_start, local_end
+
+    rows = df[
+        (df["track_id"].astype(int).isin(track_set))
+        & (df["timestamp_sec"].astype(float) >= ts_start)
+        & (df["timestamp_sec"].astype(float) <= ts_end)
+    ].copy()
+    if rows.empty:
+        return ({}, None)
+
+    rows["timestamp_sec"] = rows["timestamp_sec"].astype(float)
+    rows["cx"] = (rows["x1"].astype(float) + rows["x2"].astype(float)) / 2.0
+    rows["cy"] = (rows["y1"].astype(float) + rows["y2"].astype(float)) / 2.0
+
+    motion_by_track: dict[int, str] = {}
+    traces: dict[int, list[tuple[float, float, float]]] = {}
+    for tid in sorted(track_set):
+        tr = rows[rows["track_id"].astype(int) == tid].sort_values("timestamp_sec")
+        if tr.empty:
+            continue
+        traces[tid] = [(float(r.timestamp_sec), float(r.cx), float(r.cy)) for r in tr.itertuples(index=False)]
+        if len(traces[tid]) < 2:
+            motion_by_track[tid] = "is observed briefly with limited motion history"
+            continue
+        first = traces[tid][0]
+        last = traces[tid][-1]
+        dx = float(last[1] - first[1])
+        dy = float(last[2] - first[2])
+        motion_by_track[tid] = _movement_descriptor(dx, dy)
+
+                                                 
+    pair_note: str | None = None
+    if all(tid in traces for tid in track_set):
+        left = traces[int(primary_pair[0])]
+        right = traces[int(primary_pair[1])]
+        left_by_ts = {round(ts, 2): (cx, cy) for ts, cx, cy in left}
+        right_by_ts = {round(ts, 2): (cx, cy) for ts, cx, cy in right}
+        shared = sorted(set(left_by_ts.keys()).intersection(right_by_ts.keys()))
+        if shared:
+            dists: list[float] = []
+            for ts in shared:
+                lcx, lcy = left_by_ts[ts]
+                rcx, rcy = right_by_ts[ts]
+                dists.append(math.hypot(lcx - rcx, lcy - rcy))
+            start_dist = float(dists[0])
+            min_dist = float(min(dists))
+            if start_dist - min_dist >= 20.0:
+                pair_note = "Their separation decreases clearly near the impact point."
+            elif min_dist <= 30.0:
+                pair_note = "They come into close proximity near impact."
+
+    return (motion_by_track, pair_note)
+
+
+def _build_grounded_statement(
+    event_type: str,
+    start_sec: float,
+    end_sec: float,
+    primary_track_ids: list[int],
+    pair_candidates: list[dict[str, Any]],
+    class_map: dict[int, str],
+    tracks_csv_path: str | None,
+) -> tuple[str, list[str]]:
+    event = str(event_type).strip().lower()
+    primary_pair = [int(tid) for tid in primary_track_ids[:2] if str(tid).strip()]
+    primary_ts = _pair_peak_time(primary_pair, pair_candidates) if len(primary_pair) == 2 else None
+    switch_notes = _infer_id_switch_notes(primary_pair, pair_candidates, class_map, primary_ts)
+
+    if event == "collision" and len(primary_pair) == 2:
+        left = _label_track(primary_pair[0], class_map)
+        right = _label_track(primary_pair[1], class_map)
+        motion_by_track, pair_note = _track_motion_context(
+            tracks_csv_path=tracks_csv_path,
+            primary_pair=primary_pair,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            primary_ts=primary_ts,
+        )
+        if primary_ts is not None:
+            base = (
+                f"Between {start_sec:.2f}s and {end_sec:.2f}s, {left} and {right} show the strongest "
+                f"collision interaction near {primary_ts:.2f}s."
+            )
+        else:
+            base = (
+                f"Between {start_sec:.2f}s and {end_sec:.2f}s, {left} and {right} show the strongest "
+                "collision interaction in this segment."
+            )
+        left_motion = motion_by_track.get(int(primary_pair[0]))
+        right_motion = motion_by_track.get(int(primary_pair[1]))
+        if left_motion and right_motion:
+            base += f" Motion context: {left} {left_motion}; {right} {right_motion}."
+        elif left_motion:
+            base += f" Motion context: {left} {left_motion}."
+        elif right_motion:
+            base += f" Motion context: {right} {right_motion}."
+        if pair_note:
+            base += f" {pair_note}"
+
+        secondary_pair, secondary_ts = _find_secondary_pair(primary_pair, pair_candidates, primary_ts)
+        if len(secondary_pair) == 2:
+            left2 = _label_track(secondary_pair[0], class_map)
+            right2 = _label_track(secondary_pair[1], class_map)
+            if secondary_ts is not None:
+                base += (
+                    f" A secondary interaction candidate appears near {secondary_ts:.2f}s between "
+                    f"{left2} and {right2}."
+                )
+            else:
+                base += f" A secondary interaction candidate appears between {left2} and {right2}."
+        if switch_notes:
+            base += " Tracking continuity may include an ID switch; review frame-by-frame near impact."
+        return (base, switch_notes)
+
+                                                              
+    return (
+        f"Between {start_sec:.2f}s and {end_sec:.2f}s, evidence indicates a {event or 'traffic'} event in this segment.",
+        switch_notes,
+    )
+
+
+def _build_statement_polish_prompt(
+    event_type: str,
+    primary_track_ids: list[int],
+    secondary_track_ids: list[int],
+    grounded_statement: str,
+    tracking_notes: list[str],
+) -> str:
+    return (
+        "Rewrite the incident statement for human readability.\n"
+        "Strict constraints:\n"
+        "1) Keep the same factual meaning as provided.\n"
+        "2) Do not invent color, lane, or street-role facts.\n"
+        "3) Do not use pixel units or camera-axis terms like upward/downward.\n"
+        "4) Keep track IDs explicit for primary participants.\n"
+        "5) 1-3 sentences max.\n"
+        "Return JSON only: {\"statement\":\"...\"}\n\n"
+        f"event_type: {event_type}\n"
+        f"primary_track_ids: {primary_track_ids}\n"
+        f"secondary_track_ids: {secondary_track_ids}\n"
+        f"tracking_notes: {tracking_notes}\n"
+        f"grounded_statement: {grounded_statement}\n"
+    )
+
+
+def _polish_grounded_statement_with_ai(
+    client: OpenAIResponsesClient,
+    model: str,
+    event_type: str,
+    primary_track_ids: list[int],
+    secondary_track_ids: list[int],
+    grounded_statement: str,
+    tracking_notes: list[str],
+    keyframes: list[str],
+    max_retries: int,
+) -> str:
+    if not grounded_statement.strip():
+        return grounded_statement
+    if not keyframes:
+        return grounded_statement
+
+    prompt = _build_statement_polish_prompt(
+        event_type=event_type,
+        primary_track_ids=primary_track_ids,
+        secondary_track_ids=secondary_track_ids,
+        grounded_statement=grounded_statement,
+        tracking_notes=tracking_notes,
+    )
+    try:
+        payload = client.respond_json_with_images(
+            model=model,
+            prompt_text=prompt,
+            image_paths=keyframes[:8],
+            max_retries=max_retries,
+        )
+    except Exception:
+        return grounded_statement
+
+    candidate = " ".join(str(payload.get("statement", "")).strip().split()) if isinstance(payload, dict) else ""
+    if not candidate:
+        return grounded_statement
+                                                              
+    missing_primary = [tid for tid in primary_track_ids[:2] if f"track {int(tid)}" not in candidate.lower()]
+    if missing_primary:
+        return grounded_statement
+    return candidate
+
+
+def _parse_claim_number(claim_id: str) -> int | None:
+    import re
+
+    match = re.match(_CLAIM_ID_NUM_PATTERN, str(claim_id).strip())
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _next_claim_id(used_ids: set[str]) -> str:
+    max_num = 0
+    for value in used_ids:
+        num = _parse_claim_number(value)
+        if num is not None:
+            max_num = max(max_num, num)
+    return f"clm_{max_num + 1:03d}"
+
+
+def _normalized_primary_ids(result: dict[str, Any]) -> list[int]:
+    primary = result.get("primary_track_ids", [])
+    if not isinstance(primary, list):
+        return []
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw in primary:
+        try:
+            tid = int(raw)
+        except Exception:
+            continue
+        if tid < 0 or tid in seen:
+            continue
+        seen.add(tid)
+        out.append(tid)
+    return out
+
+
+def _primary_pair_key(result: dict[str, Any]) -> tuple[int, ...]:
+    ids = _normalized_primary_ids(result)
+    if len(ids) >= 2:
+        return tuple(sorted(ids[:2]))
+    return tuple(ids)
+
+
+def _primary_pair_peak_ts(result: dict[str, Any]) -> float | None:
+    pair_key = _primary_pair_key(result)
+    if len(pair_key) < 2:
+        return None
+    pair_candidates = result.get("impact_pair_candidates", [])
+    if not isinstance(pair_candidates, list):
+        return None
+    best_ts: float | None = None
+    best_score = -1e9
+    for item in pair_candidates:
+        if not isinstance(item, dict):
+            continue
+        pair = item.get("pair", [])
+        if not isinstance(pair, list) or len(pair) != 2:
+            continue
+        try:
+            key = tuple(sorted([int(pair[0]), int(pair[1])]))
+        except Exception:
+            continue
+        if key != pair_key:
+            continue
+        try:
+            score = float(item.get("selection_score", item.get("peak_score", 0.0)))
+        except Exception:
+            score = 0.0
+        ts_raw = item.get("peak_timestamp_sec")
+        ts_val = float(ts_raw) if isinstance(ts_raw, (int, float)) else None
+        if score > best_score:
+            best_score = score
+            best_ts = ts_val
+    return best_ts
+
+
+def _claim_result_signature(result: dict[str, Any]) -> tuple[Any, ...]:
+    event_type = str(result.get("event_type", "none")).strip().lower() or "none"
+    pair_key = _primary_pair_key(result)
+    if pair_key:
+        peak_ts = _primary_pair_peak_ts(result)
+        ts_bucket = round(float(peak_ts) * 2.0) / 2.0 if peak_ts is not None else None
+        return ("pair", event_type, pair_key, ts_bucket)
+    statement = " ".join(str(result.get("grounded_statement", "")).strip().lower().split())
+    if not statement:
+        statement = " ".join(str(result.get("rationale", "")).strip().lower().split())
+    return ("text", event_type, statement)
+
+
+def _claim_result_priority(result: dict[str, Any]) -> tuple[int, float, int, int]:
+    method = str(result.get("method", "")).strip().lower()
+    method_rank = {"ai": 3, "heuristic_fallback": 2, "derived_secondary": 1}.get(method, 0)
+    conf_raw = result.get("decision_confidence", 0.0)
+    try:
+        confidence = float(conf_raw)
+    except Exception:
+        confidence = 0.0
+    has_statement = 1 if str(result.get("grounded_statement", "")).strip() else 0
+    primary_len = len(_normalized_primary_ids(result))
+    return (method_rank, confidence, has_statement, primary_len)
+
+
+def _dedupe_claim_results(claim_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    chosen: dict[tuple[Any, ...], dict[str, Any]] = {}
+    chosen_score: dict[tuple[Any, ...], tuple[int, float, int, int]] = {}
+    key_order: list[tuple[Any, ...]] = []
+
+    for item in claim_results:
+        if not isinstance(item, dict):
+            continue
+        key = _claim_result_signature(item)
+        score = _claim_result_priority(item)
+        if key not in chosen:
+            chosen[key] = item
+            chosen_score[key] = score
+            key_order.append(key)
+            continue
+        if score > chosen_score[key]:
+            chosen[key] = item
+            chosen_score[key] = score
+
+    deduped = [chosen[key] for key in key_order]
+    for idx, item in enumerate(deduped, start=1):
+        item["claim_id"] = f"clm_{idx:03d}"
+    return deduped
+
+
+def _derive_secondary_collision_claim_results(
+    base_claim: dict[str, Any],
+    base_result: dict[str, Any],
+    perception_item: dict[str, Any],
+    used_claim_ids: set[str],
+) -> list[dict[str, Any]]:
+
+    if str(base_result.get("event_type", "")).strip().lower() != "collision":
+        return []
+
+    pair_candidates = base_result.get("impact_pair_candidates", [])
+    if not isinstance(pair_candidates, list) or len(pair_candidates) < 2:
+        return []
+
+    primary_pair = base_result.get("primary_track_ids", [])
+    if not isinstance(primary_pair, list) or len(primary_pair) < 2:
+        return []
+    primary_pair_norm = sorted([int(primary_pair[0]), int(primary_pair[1])])
+
+    primary_ts_raw = base_result.get("impact_anchor_pair_hint", [])
+    _ = primary_ts_raw
+    primary_peak_ts = _pair_peak_time(primary_pair_norm, pair_candidates)
+    primary_score = 0.0
+    for item in pair_candidates:
+        if not isinstance(item, dict):
+            continue
+        pair = item.get("pair", [])
+        if not isinstance(pair, list) or len(pair) != 2:
+            continue
+        if sorted([int(pair[0]), int(pair[1])]) == primary_pair_norm:
+            primary_score = float(item.get("selection_score", item.get("peak_score", 0.0)))
+            break
+
+    start_sec = float(perception_item.get("start_sec", 0.0))
+    end_sec = float(perception_item.get("end_sec", start_sec))
+    if end_sec < start_sec:
+        start_sec, end_sec = end_sec, start_sec
+
+    event_type = str(base_result.get("event_type", "collision")).strip().lower() or "collision"
+    out: list[dict[str, Any]] = []
+    for candidate in pair_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        pair = candidate.get("pair", [])
+        if not isinstance(pair, list) or len(pair) != 2:
+            continue
+        pair_norm = sorted([int(pair[0]), int(pair[1])])
+        if pair_norm == primary_pair_norm:
+            continue
+
+        secondary_ts = candidate.get("peak_timestamp_sec")
+        secondary_peak_ts = float(secondary_ts) if isinstance(secondary_ts, (int, float)) else None
+        if primary_peak_ts is not None and secondary_peak_ts is not None:
+            if abs(secondary_peak_ts - primary_peak_ts) < 0.4:
+                continue
+
+        secondary_score = float(candidate.get("selection_score", candidate.get("peak_score", 0.0)))
+        if secondary_score < 0.30:
+            continue
+        if primary_score > 0.0 and secondary_score < primary_score * 0.72:
+            continue
+
+        claim_id = _next_claim_id(used_claim_ids)
+        used_claim_ids.add(claim_id)
+        support_conf = max(0.55, min(0.95, secondary_score))
+        if primary_score > 0.0:
+            support_conf = max(0.55, min(0.95, float(base_claim.get("support_confidence", 0.8)) * (secondary_score / primary_score)))
+
+        if secondary_peak_ts is not None:
+            statement = (
+                f"Between {start_sec:.2f}s and {end_sec:.2f}s, a second collision interaction is observed "
+                f"near {secondary_peak_ts:.2f}s between track {pair_norm[0]} and track {pair_norm[1]}."
+            )
+        else:
+            statement = (
+                f"Between {start_sec:.2f}s and {end_sec:.2f}s, a second collision interaction is observed "
+                f"between track {pair_norm[0]} and track {pair_norm[1]}."
+            )
+
+        out.append(
+            {
+                "claim_id": claim_id,
+                "event_type": event_type,
+                "candidate_track_ids": list(base_result.get("candidate_track_ids", [])),
+                "keyframes_used": list(base_result.get("keyframes_used", [])),
+                "strongest_keyframe": base_result.get("strongest_keyframe"),
+                "impact_anchor_track_ids": list(base_result.get("impact_anchor_track_ids", [])),
+                "impact_anchor_pair_hint": pair_norm,
+                "impact_anchor_pair_score": round(float(candidate.get("peak_score", 0.0)), 4),
+                "impact_pair_candidates": pair_candidates[:5],
+                "method": "derived_secondary",
+                "primary_track_ids": pair_norm,
+                "secondary_track_ids": [],
+                "decision_confidence": round(float(support_conf), 4),
+                "derived_support_confidence": round(float(support_conf), 4),
+                "rationale": "Derived additional collision claim from a distinct strong impact-pair candidate.",
+                "ambiguity_flags": [],
+                "grounded_statement": statement,
+                "tracking_notes": [],
+            }
+        )
+                                                                          
+        break
+
+    return out
+
+
+def _order_keyframes_by_time(
+    keyframe_paths: list[str],
+    frames_json_path: str | None,
+    video_path: str | None,
+) -> list[str]:
+    rows: list[tuple[float, str]] = []
+    for path in keyframe_paths:
+        meta = services.resolve_keyframe_metadata(
+            keyframe_path=path,
+            frames_json_path=frames_json_path,
+            video_path=video_path,
+            fallback_fps=2.0,
+        )
+        timestamp = meta.get("timestamp_sec")
+        ts_val = float(timestamp) if isinstance(timestamp, (int, float)) else float("inf")
+        rows.append((ts_val, path))
+    rows.sort(key=lambda item: (item[0], item[1]))
+    return [path for _ts, path in rows]
+
+
+def _focus_keyframes_around_strongest(
+    keyframes: list[str],
+    strongest_keyframe: str | None,
+    max_frames: int,
+) -> list[str]:
+    if not keyframes:
+        return []
+    if max_frames <= 0:
+        return keyframes[:]
+    if strongest_keyframe not in keyframes:
+        return _sample_evenly(keyframes, max_frames)
+
+    idx = keyframes.index(strongest_keyframe)
+    target_total = min(max_frames, len(keyframes))
+                                                                       
+    focus_target = max(2, min(target_total, int(round(target_total * 0.7))))
+    chosen_indices = [idx]
+    radius = 1
+    while len(chosen_indices) < focus_target:
+        added = False
+        left = idx - radius
+        right = idx + radius
+        if left >= 0:
+            chosen_indices.append(left)
+            added = True
+            if len(chosen_indices) >= focus_target:
+                break
+        if right < len(keyframes):
+            chosen_indices.append(right)
+            added = True
+        if not added:
+            break
+        radius += 1
+
+    chosen_indices = sorted(set(chosen_indices))
+    if len(chosen_indices) >= target_total:
+        return [keyframes[i] for i in chosen_indices[:target_total]]
+
+                                                                  
+    context_pool = [i for i in range(len(keyframes)) if i not in set(chosen_indices)]
+    if context_pool:
+        sampled_context = _sample_evenly([str(i) for i in context_pool], target_total - len(chosen_indices))
+        for raw_idx in sampled_context:
+            try:
+                i = int(raw_idx)
+            except Exception:
+                continue
+            if i not in chosen_indices:
+                chosen_indices.append(i)
+                if len(chosen_indices) >= target_total:
+                    break
+
+    chosen_indices = sorted(set(chosen_indices))[:target_total]
+    return [keyframes[i] for i in chosen_indices]
+
+
+def _best_pair_single_frame(rows: list[dict[str, Any]]) -> list[int]:
+    pair, _score = _best_pair_single_frame_with_score(rows)
+    return pair
+
+
+def _best_pair_single_frame_with_score(rows: list[dict[str, Any]]) -> tuple[list[int], float]:
+    if len(rows) < 2:
+        return ([], 0.0)
+
+    def _center(row: dict[str, Any]) -> tuple[float, float]:
+        return ((float(row["x1"]) + float(row["x2"])) / 2.0, (float(row["y1"]) + float(row["y2"])) / 2.0)
+
+    def _area(row: dict[str, Any]) -> float:
+        return max(0.0, float(row["x2"]) - float(row["x1"])) * max(0.0, float(row["y2"]) - float(row["y1"]))
+
+    def _iou(left: dict[str, Any], right: dict[str, Any]) -> float:
+        ix1 = max(float(left["x1"]), float(right["x1"]))
+        iy1 = max(float(left["y1"]), float(right["y1"]))
+        ix2 = min(float(left["x2"]), float(right["x2"]))
+        iy2 = min(float(left["y2"]), float(right["y2"]))
+        iw = max(0.0, ix2 - ix1)
+        ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        union = _area(left) + _area(right) - inter
+        return 0.0 if union <= 0.0 else inter / union
+
+    best_per_track: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        tid = int(row.get("track_id", -1))
+        if tid < 0:
+            continue
+        prev = best_per_track.get(tid)
+        if prev is None or float(row.get("conf", 0.0)) > float(prev.get("conf", 0.0)):
+            best_per_track[tid] = row
+
+    uniq_rows = list(best_per_track.values())
+    if len(uniq_rows) < 2:
+        return ([], 0.0)
+
+    best_score = -1.0
+    best_pair: list[int] = []
+    for left, right in combinations(uniq_rows, 2):
+        cx1, cy1 = _center(left)
+        cx2, cy2 = _center(right)
+        dist = math.hypot(cx1 - cx2, cy1 - cy2)
+        diag = max(1.0, math.sqrt(max(1.0, (_area(left) + _area(right)) / 2.0)))
+        proximity = max(0.0, 1.0 - min(dist / diag, 3.0) / 3.0)
+        overlap = _iou(left, right)
+        conf_mean = (float(left.get("conf", 0.0)) + float(right.get("conf", 0.0))) / 2.0
+        score = (0.7 * proximity + 0.3 * overlap) * max(0.0, min(1.0, conf_mean))
+        if score > best_score:
+            best_score = score
+            best_pair = sorted([int(left["track_id"]), int(right["track_id"])])
+
+    return (best_pair, max(0.0, float(best_score)))
+
+
+def resolve_claim_involvement(
+    claim: dict[str, Any],
+    perception_item: dict[str, Any],
+    frames_json_path: str | None,
+    video_path: str | None,
+    tracks_csv_path: str | None,
+    model: str,
+    max_frames: int = 6,
+    max_retries: int = 2,
+    use_ai: bool = True,
+    prompt_template: str = DEFAULT_INVOLVEMENT_PROMPT,
+) -> dict[str, Any]:
+    keyframes_raw = perception_item.get("keyframes", [])
+    keyframes_all = [str(path) for path in keyframes_raw] if isinstance(keyframes_raw, list) else []
+    keyframes_for_claim_all = services.map_claim_to_keyframes(claim, keyframes_all)
+    if not keyframes_for_claim_all:
+        keyframes_for_claim_all = keyframes_all[:]
+    ordered_claim_keyframes = _order_keyframes_by_time(
+        keyframe_paths=keyframes_for_claim_all,
+        frames_json_path=frames_json_path,
+        video_path=video_path,
+    )
+
+    support = services.evaluate_claim_visual_support(
+        claim=claim,
+        keyframe_paths=ordered_claim_keyframes,
+        frames_json_path=frames_json_path,
+        video_path=video_path,
+        tracks_csv_path=tracks_csv_path,
+    )
+    strongest_keyframe = str(support.get("strongest_evidence_frame") or "")
+    focused_keyframes = _focus_keyframes_around_strongest(
+        keyframes=ordered_claim_keyframes,
+        strongest_keyframe=strongest_keyframe if strongest_keyframe else None,
+        max_frames=max(1, int(max_frames)),
+    )
+    if not focused_keyframes:
+        focused_keyframes = _sample_evenly(ordered_claim_keyframes, max(1, int(max_frames)))
+    segment_id = str(perception_item.get("segment_id", "segment")).strip() or "segment"
+    claim_id = str(claim.get("claim_id", "claim")).strip() or "claim"
+    ai_keyframes = _render_keyframes_for_involvement_ai(
+        keyframes=focused_keyframes,
+        claim_id=claim_id,
+        segment_id=segment_id,
+        frames_json_path=frames_json_path,
+        video_path=video_path,
+        tracks_csv_path=tracks_csv_path,
+    )
+    if not ai_keyframes:
+        ai_keyframes = focused_keyframes[:]
+
+    track_evidence = services.summarize_claim_track_evidence(
+        claim=claim,
+        keyframe_paths=focused_keyframes,
+        frames_json_path=frames_json_path,
+        video_path=video_path,
+        tracks_csv_path=tracks_csv_path,
+    )
+    pair_candidates = track_evidence.get("impact_pair_candidates", [])
+    top_pair_candidate: list[int] = []
+    top_pair_score = 0.0
+    if isinstance(pair_candidates, list) and pair_candidates:
+        first = pair_candidates[0]
+        if isinstance(first, dict):
+            pair = first.get("pair", [])
+            if isinstance(pair, list) and len(pair) == 2:
+                try:
+                    top_pair_candidate = [int(pair[0]), int(pair[1])]
+                    top_pair_score = float(first.get("peak_score", 0.0))
+                except Exception:
+                    top_pair_candidate = []
+                    top_pair_score = 0.0
+
+    anchor_track_ids: list[int] = []
+    anchor_pair: list[int] = []
+    anchor_pair_score = 0.0
+    if strongest_keyframe:
+        anchor_meta = services.resolve_keyframe_metadata(
+            keyframe_path=strongest_keyframe,
+            frames_json_path=frames_json_path,
+            video_path=video_path,
+            fallback_fps=2.0,
+        )
+        anchor_ts = anchor_meta.get("timestamp_sec")
+        anchor_rows_payload = services.tracks_at_timestamp(
+            tracks_csv_path=tracks_csv_path,
+            timestamp_sec=float(anchor_ts) if isinstance(anchor_ts, (int, float)) else None,
+            time_tolerance_sec=0.12,
+        )
+        anchor_rows = anchor_rows_payload.get("rows", []) if isinstance(anchor_rows_payload, dict) else []
+        if isinstance(anchor_rows, list) and anchor_rows:
+            seen_anchor: set[int] = set()
+            for row in sorted(anchor_rows, key=lambda item: float(item.get("conf", 0.0)), reverse=True):
+                tid = int(row.get("track_id", -1))
+                if tid < 0 or tid in seen_anchor:
+                    continue
+                seen_anchor.add(tid)
+                anchor_track_ids.append(tid)
+            anchor_pair, anchor_pair_score = _best_pair_single_frame_with_score(anchor_rows)
+
+    candidate_track_ids = [int(tid) for tid in track_evidence.get("track_ids", []) if str(tid).strip()]
+    fallback_primary = [int(tid) for tid in track_evidence.get("involved_track_ids", []) if str(tid).strip()]
+    fallback_secondary: list[int] = []
+    if isinstance(pair_candidates, list):
+        for item in pair_candidates[1:3]:
+            if not isinstance(item, dict):
+                continue
+            pair = item.get("pair", [])
+            if not isinstance(pair, list):
+                continue
+            for raw_tid in pair:
+                try:
+                    tid = int(raw_tid)
+                except Exception:
+                    continue
+                if tid not in fallback_secondary:
+                    fallback_secondary.append(tid)
+
+    for tid in anchor_track_ids:
+        if tid not in candidate_track_ids:
+            candidate_track_ids.append(tid)
+    event_type = str(claim.get("event_type", "")).strip().lower()
+    if event_type == "collision" and len(top_pair_candidate) == 2:
+                                                                                
+        anchor_pair = top_pair_candidate[:]
+        anchor_pair_score = float(top_pair_score)
+    if anchor_pair:
+        fallback_primary = anchor_pair[:]
+
+    anchor_reliable = event_type == "collision" and len(anchor_pair) == 2 and float(anchor_pair_score) >= 0.20
+
+    base = {
+        "claim_id": str(claim.get("claim_id", "claim")),
+        "event_type": str(claim.get("event_type", "unknown")),
+        "candidate_track_ids": candidate_track_ids,
+        "keyframes_used": focused_keyframes,
+        "ai_keyframes_used": ai_keyframes,
+        "strongest_keyframe": strongest_keyframe or None,
+        "impact_anchor_track_ids": anchor_track_ids,
+        "impact_anchor_pair_hint": anchor_pair,
+        "impact_anchor_pair_score": round(float(anchor_pair_score), 4),
+        "method": "heuristic_fallback",
+    }
+    start_sec = float(perception_item.get("start_sec", 0.0))
+    end_sec = float(perception_item.get("end_sec", start_sec))
+    if end_sec < start_sec:
+        start_sec, end_sec = end_sec, start_sec
+    if not use_ai or not focused_keyframes or not candidate_track_ids:
+        normalized = normalize_involvement_response({}, candidate_track_ids, fallback_primary)
+        if not normalized.get("secondary_track_ids") and fallback_secondary:
+            normalized["secondary_track_ids"] = [
+                tid
+                for tid in fallback_secondary
+                if tid in set(candidate_track_ids) and tid not in set(normalized.get("primary_track_ids", []))
+            ][:3]
+        if anchor_reliable:
+            normalized["primary_track_ids"] = anchor_pair[:2]
+        class_map = _class_map_from_track_evidence(track_evidence)
+        grounded_statement, switch_notes = _build_grounded_statement(
+            event_type=event_type,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            primary_track_ids=normalized.get("primary_track_ids", []),
+            pair_candidates=pair_candidates if isinstance(pair_candidates, list) else [],
+            class_map=class_map,
+            tracks_csv_path=tracks_csv_path,
+        )
+        flags = normalized.get("ambiguity_flags", [])
+        if not isinstance(flags, list):
+            flags = []
+        if switch_notes and "possible_id_switch" not in flags:
+            flags.append("possible_id_switch")
+        normalized["ambiguity_flags"] = flags
+        return {
+            **base,
+            **normalized,
+            "impact_pair_candidates": pair_candidates[:5] if isinstance(pair_candidates, list) else [],
+            "grounded_statement": grounded_statement,
+            "tracking_notes": switch_notes,
+        }
+
+    prompt_text = _build_prompt(
+        claim=claim,
+        track_evidence=track_evidence,
+        prompt_template=prompt_template,
+        anchor_track_ids=anchor_track_ids,
+        anchor_pair=anchor_pair,
+    )
+    client = OpenAIResponsesClient.from_env()
+    raw = client.respond_json_with_images(
+        model=model,
+        prompt_text=prompt_text,
+        image_paths=ai_keyframes,
+        max_retries=max_retries,
+    )
+    ai_primary_raw = _dedupe_ints(raw.get("primary_track_ids", []), set(candidate_track_ids))
+    normalized = normalize_involvement_response(raw, candidate_track_ids, fallback_primary)
+    if not normalized.get("secondary_track_ids") and fallback_secondary:
+        normalized["secondary_track_ids"] = [
+            tid
+            for tid in fallback_secondary
+            if tid in set(candidate_track_ids) and tid not in set(normalized.get("primary_track_ids", []))
+        ][:3]
+
+                                                                                             
+                                                                     
+    if anchor_reliable:
+        ai_primary = normalized.get("primary_track_ids", [])
+        if not isinstance(ai_primary, list):
+            ai_primary = []
+        try:
+            ai_pair = [int(ai_primary[0]), int(ai_primary[1])] if len(ai_primary) >= 2 else []
+        except Exception:
+            ai_pair = []
+        ai_primary_set = set(ai_pair)
+        anchor_pair_set = set(int(tid) for tid in anchor_pair)
+        ai_conf = float(normalized.get("decision_confidence", 0.0))
+        anchor_strength = float(_pair_strength(anchor_pair, pair_candidates if isinstance(pair_candidates, list) else []))
+        ai_strength = float(_pair_strength(ai_pair, pair_candidates if isinstance(pair_candidates, list) else []))
+        keep_ai = False
+        if ai_primary_set == anchor_pair_set:
+            keep_ai = True
+                                                                            
+                                                                               
+        elif len(ai_pair) == 2 and ai_conf >= 0.90 and len(ai_primary_set.intersection(anchor_pair_set)) >= 1:
+            keep_ai = True
+        elif len(ai_pair) == 2 and ai_strength > 0.0:
+                                                                                
+                                                                
+            if ai_conf >= 0.85 and ai_strength >= max(0.0, anchor_strength * 0.80):
+                keep_ai = True
+            if ai_strength >= max(0.0, anchor_strength * 1.05):
+                keep_ai = True
+
+        if not keep_ai:
+            normalized["primary_track_ids"] = anchor_pair[:2]
+            normalized["decision_confidence"] = min(float(normalized.get("decision_confidence", 0.0)), 0.75)
+            flags = normalized.get("ambiguity_flags", [])
+            if not isinstance(flags, list):
+                flags = []
+            if "ai_anchor_adjusted" not in flags:
+                flags.append("ai_anchor_adjusted")
+            normalized["ambiguity_flags"] = flags
+            rationale = str(normalized.get("rationale", "")).strip()
+            suffix = f"Adjusted to strongest-frame anchor pair {anchor_pair} due to anchor-priority collision guardrail."
+            normalized["rationale"] = f"{rationale} {suffix}".strip()
+
+    class_map = _class_map_from_track_evidence(track_evidence)
+    grounded_statement, switch_notes = _build_grounded_statement(
+        event_type=event_type,
+        start_sec=start_sec,
+        end_sec=end_sec,
+        primary_track_ids=normalized.get("primary_track_ids", []),
+        pair_candidates=pair_candidates if isinstance(pair_candidates, list) else [],
+        class_map=class_map,
+        tracks_csv_path=tracks_csv_path,
+    )
+    grounded_statement = _polish_grounded_statement_with_ai(
+        client=client,
+        model=model,
+        event_type=event_type,
+        primary_track_ids=[int(tid) for tid in normalized.get("primary_track_ids", []) if str(tid).strip()],
+        secondary_track_ids=[int(tid) for tid in normalized.get("secondary_track_ids", []) if str(tid).strip()],
+        grounded_statement=grounded_statement,
+        tracking_notes=switch_notes,
+        keyframes=ai_keyframes,
+        max_retries=max_retries,
+    )
+    flags = normalized.get("ambiguity_flags", [])
+    if not isinstance(flags, list):
+        flags = []
+    if switch_notes and "possible_id_switch" not in flags:
+        flags.append("possible_id_switch")
+    normalized["ambiguity_flags"] = flags
+
+    return {
+        **base,
+        **normalized,
+        "ai_primary_track_ids": ai_primary_raw,
+        "impact_pair_candidates": pair_candidates[:5] if isinstance(pair_candidates, list) else [],
+        "grounded_statement": grounded_statement,
+        "tracking_notes": switch_notes,
+        "method": "ai",
+    }
+
+
+def run_involvement_for_report(
+    report_json_path: str | Path,
+    perception_json_path: str | Path,
+    frames_json_path: str | Path | None,
+    tracks_csv_path: str | Path | None,
+    out_json_path: str | Path,
+    model: str,
+    max_frames: int = 6,
+    max_retries: int = 2,
+    use_ai: bool = True,
+    prompt_path: str | Path | None = None,
+) -> dict[str, Any]:
+    report_payload = services.load_json(report_json_path)
+    if not isinstance(report_payload, dict):
+        raise ValueError("Report JSON must be an object")
+    perception_payload = services.load_json(perception_json_path)
+    if not isinstance(perception_payload, list):
+        raise ValueError("Perception JSON must be a list")
+
+    segments = report_payload.get("segments", [])
+    report_segment = segments[0] if isinstance(segments, list) and segments and isinstance(segments[0], dict) else {}
+    segment_id = str(report_segment.get("segment_id", "")).strip()
+    perception_item = next(
+        (
+            item
+            for item in perception_payload
+            if isinstance(item, dict) and str(item.get("segment_id", "")).strip() == segment_id
+        ),
+        perception_payload[0] if perception_payload and isinstance(perception_payload[0], dict) else {},
+    )
+    if not isinstance(perception_item, dict):
+        raise ValueError("Could not resolve perception segment item for report")
+
+    prompt_text = DEFAULT_INVOLVEMENT_PROMPT
+    if prompt_path:
+        p = Path(prompt_path)
+        if p.exists() and p.is_file():
+            prompt_text = p.read_text(encoding="utf-8").strip() or DEFAULT_INVOLVEMENT_PROMPT
+
+    meta = report_payload.get("meta", {})
+    source_video = str(meta.get("source_video", "")).strip() if isinstance(meta, dict) else ""
+    if not source_video and perception_item:
+        source_video = str(Path(report_json_path)).strip()
+
+    claims = [item for item in report_segment.get("claims", []) if isinstance(item, dict)]
+    claim_results: list[dict[str, Any]] = []
+    derived_for_primary_pairs: set[tuple[int, ...]] = set()
+    used_claim_ids: set[str] = {str(item.get("claim_id", "")).strip() for item in claims if str(item.get("claim_id", "")).strip()}
+    for claim in claims:
+        result = resolve_claim_involvement(
+            claim=claim,
+            perception_item=perception_item,
+            frames_json_path=str(frames_json_path) if frames_json_path else None,
+            video_path=source_video or None,
+            tracks_csv_path=str(tracks_csv_path) if tracks_csv_path else None,
+            model=model,
+            max_frames=max_frames,
+            max_retries=max_retries,
+            use_ai=use_ai,
+            prompt_template=prompt_text,
+        )
+        claim_results.append(result)
+        primary_pair = _primary_pair_key(result)
+        if primary_pair and primary_pair not in derived_for_primary_pairs:
+            derived = _derive_secondary_collision_claim_results(
+                base_claim=claim,
+                base_result=result,
+                perception_item=perception_item,
+                used_claim_ids=used_claim_ids,
+            )
+            claim_results.extend(derived)
+            derived_for_primary_pairs.add(primary_pair)
+
+    claim_results = _dedupe_claim_results(claim_results)
+    ai_count = sum(1 for item in claim_results if isinstance(item, dict) and str(item.get("method", "")).strip().lower() == "ai")
+
+    out_payload = {
+        "report_json": str(report_json_path),
+        "perception_json": str(perception_json_path),
+        "frames_json": str(frames_json_path) if frames_json_path else None,
+        "tracks_csv": str(tracks_csv_path) if tracks_csv_path else None,
+        "segment_id": segment_id or None,
+        "model": model,
+        "claims": claim_results,
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    out_path = Path(out_json_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(out_payload, indent=2), encoding="utf-8")
+
+    return {
+        "out_json": str(out_path),
+        "claims": len(claim_results),
+        "ai_used": ai_count,
+        "fallback_used": len(claim_results) - ai_count,
+    }

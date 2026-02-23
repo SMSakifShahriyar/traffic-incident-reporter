@@ -1,0 +1,484 @@
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+
+def compute_frame_energy(frame_path_prev: str | Path, frame_path_curr: str | Path) -> float:
+
+    prev_path = Path(frame_path_prev)
+    curr_path = Path(frame_path_curr)
+
+    if not prev_path.exists():
+        raise FileNotFoundError(f"Previous frame not found: {prev_path}")
+    if not curr_path.exists():
+        raise FileNotFoundError(f"Current frame not found: {curr_path}")
+
+    prev_img = cv2.imread(str(prev_path), cv2.IMREAD_GRAYSCALE)
+    curr_img = cv2.imread(str(curr_path), cv2.IMREAD_GRAYSCALE)
+
+    if prev_img is None:
+        raise ValueError(f"Unable to read previous frame: {prev_path}")
+    if curr_img is None:
+        raise ValueError(f"Unable to read current frame: {curr_path}")
+    if prev_img.shape != curr_img.shape:
+        raise ValueError(
+            f"Frame size mismatch: {prev_path} has {prev_img.shape}, "
+            f"{curr_path} has {curr_img.shape}"
+        )
+
+    diff = cv2.absdiff(prev_img, curr_img)
+    return float(np.mean(diff))
+
+
+def build_energy_series(sampled_frames: list[dict[str, float | int | str]]) -> list[dict[str, float | int]]:
+
+    if not sampled_frames:
+        return []
+
+    ordered = sorted(sampled_frames, key=lambda item: int(item["frame_id"]))
+    energy_series: list[dict[str, float | int]] = []
+
+    for idx, frame in enumerate(ordered):
+        frame_id = int(frame["frame_id"])
+        time_sec = float(frame["time_sec"])
+
+        if idx == 0:
+            energy = 0.0
+        else:
+            prev_path = ordered[idx - 1]["path"]
+            curr_path = frame["path"]
+            energy = compute_frame_energy(str(prev_path), str(curr_path))
+
+        energy_series.append(
+            {
+                "frame_id": frame_id,
+                "time_sec": round(time_sec, 6),
+                "energy": float(round(energy, 6)),
+            }
+        )
+
+    return energy_series
+
+
+def _enforce_duration(
+    start_sec: float,
+    end_sec: float,
+    min_segment_sec: float,
+    max_segment_sec: float,
+    video_end_sec: float,
+) -> tuple[float, float]:
+    start = max(0.0, float(start_sec))
+    end = min(float(end_sec), video_end_sec)
+
+    if end < start:
+        start, end = end, start
+
+    duration = end - start
+
+    if duration > max_segment_sec:
+        center = (start + end) / 2.0
+        target = max_segment_sec
+        start = max(0.0, center - target / 2.0)
+        end = min(video_end_sec, start + target)
+        start = max(0.0, end - target)
+        duration = end - start
+
+    if duration < min_segment_sec and video_end_sec > 0:
+        target = min(min_segment_sec, video_end_sec)
+        center = (start + end) / 2.0
+        start = max(0.0, center - target / 2.0)
+        end = min(video_end_sec, start + target)
+        start = max(0.0, end - target)
+
+    return (round(start, 6), round(end, 6))
+
+
+def _overlaps(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
+    return max(a_start, b_start) < min(a_end, b_end)
+
+
+def _max_peak_within_range(
+    series: list[dict[str, float | int]],
+    start_sec: float,
+    end_sec: float,
+) -> float:
+    energies: list[float] = []
+    for item in series:
+        time_sec = float(item["time_sec"])
+        if start_sec <= time_sec <= end_sec:
+            energies.append(float(item["energy"]))
+    if not energies:
+        return 0.0
+    return float(max(energies))
+
+
+def _inject_mid_window_if_missing(
+    segments: list[dict[str, float | str]],
+    series: list[dict[str, float | int]],
+    min_segment_sec: float,
+    max_segment_sec: float,
+    video_end_sec: float,
+) -> list[dict[str, float | str]]:
+
+    if video_end_sec <= 0 or video_end_sec > 15.0:
+        return segments
+
+    focus_start = video_end_sec * 0.45
+    focus_end = video_end_sec * 0.75
+    has_focus_overlap = any(
+        _overlaps(float(seg["start_sec"]), float(seg["end_sec"]), focus_start, focus_end)
+        for seg in segments
+    )
+    if has_focus_overlap:
+        return segments
+
+    center = (focus_start + focus_end) / 2.0
+    target_duration = max(min_segment_sec, min(max_segment_sec, 4.0))
+    start = max(0.0, center - target_duration / 2.0)
+    end = min(video_end_sec, start + target_duration)
+    start = max(0.0, end - target_duration)
+    start, end = _enforce_duration(start, end, min_segment_sec, max_segment_sec, video_end_sec)
+
+    if end <= start:
+        return segments
+
+    candidate = {
+        "start_sec": start,
+        "end_sec": end,
+        "peak_energy": _max_peak_within_range(series, start, end),
+        "trigger": "mid_window",
+    }
+    merged = sorted([*segments, candidate], key=lambda item: float(item["start_sec"]))
+
+    deduped: list[dict[str, float | str]] = []
+    for seg in merged:
+        if not deduped:
+            deduped.append(seg)
+            continue
+        prev = deduped[-1]
+        if _overlaps(
+            float(prev["start_sec"]),
+            float(prev["end_sec"]),
+            float(seg["start_sec"]),
+            float(seg["end_sec"]),
+        ):
+                                                                                     
+            prev_peak = float(prev["peak_energy"])
+            cur_peak = float(seg["peak_energy"])
+            if cur_peak > prev_peak:
+                deduped[-1] = seg
+            continue
+        deduped.append(seg)
+    return deduped
+
+
+def propose_candidate_segments(
+    energy_series: list[dict[str, float | int]],
+    min_segment_sec: float = 2.0,
+    max_segment_sec: float = 8.0,
+    threshold_quantile: float = 0.85,
+    merge_gap_sec: float = 1.0,
+    max_segments: int = 3,
+) -> list[dict[str, float | str]]:
+
+    if min_segment_sec <= 0:
+        raise ValueError("min_segment_sec must be greater than 0")
+    if max_segment_sec <= 0:
+        raise ValueError("max_segment_sec must be greater than 0")
+    if min_segment_sec > max_segment_sec:
+        raise ValueError("min_segment_sec must be <= max_segment_sec")
+    if not 0.0 <= threshold_quantile <= 1.0:
+        raise ValueError("threshold_quantile must be within [0, 1]")
+    if merge_gap_sec < 0:
+        raise ValueError("merge_gap_sec must be >= 0")
+    if max_segments <= 0:
+        raise ValueError("max_segments must be greater than 0")
+
+    if not energy_series:
+        return []
+
+    series = sorted(energy_series, key=lambda item: float(item["time_sec"]))
+    video_end_sec = float(series[-1]["time_sec"])
+
+    effective_quantile = threshold_quantile
+                                                                                    
+    if video_end_sec <= 15.0 and abs(threshold_quantile - 0.85) < 1e-9:
+        effective_quantile = 0.70
+
+    energies = [float(item["energy"]) for item in series]
+    threshold_values = energies[1:] if len(energies) > 1 else energies
+    threshold_values = [value for value in threshold_values if value >= 0]
+
+    if not threshold_values:
+        return []
+
+    threshold = float(np.quantile(np.asarray(threshold_values, dtype=float), effective_quantile))
+
+    high_indices: list[int] = []
+    for idx, item in enumerate(series):
+        energy = float(item["energy"])
+        if idx == 0:
+            continue
+        if energy > 0 and energy >= threshold:
+            high_indices.append(idx)
+
+    if not high_indices:
+        return []
+
+    spans: list[dict[str, float | str]] = []
+    run_start = high_indices[0]
+    run_last = high_indices[0]
+
+    for idx in high_indices[1:]:
+        if idx == run_last + 1:
+            run_last = idx
+            continue
+
+        start = float(series[run_start]["time_sec"])
+        end = float(series[run_last]["time_sec"])
+        peak_energy = max(float(series[i]["energy"]) for i in range(run_start, run_last + 1))
+        spans.append(
+            {
+                "start_sec": start,
+                "end_sec": end,
+                "peak_energy": peak_energy,
+                "trigger": "motion_energy",
+            }
+        )
+        run_start = idx
+        run_last = idx
+
+    last_peak = max(float(series[i]["energy"]) for i in range(run_start, run_last + 1))
+    spans.append(
+        {
+            "start_sec": float(series[run_start]["time_sec"]),
+            "end_sec": float(series[run_last]["time_sec"]),
+            "peak_energy": last_peak,
+            "trigger": "motion_energy",
+        }
+    )
+
+    expanded_spans: list[dict[str, float | str]] = []
+    for span in spans:
+        start = float(span["start_sec"])
+        end = float(span["end_sec"])
+        expanded_start = max(0.0, start - 0.5)
+        expanded_end = min(video_end_sec, end + 0.5)
+        expanded_spans.append(
+            {
+                "start_sec": expanded_start,
+                "end_sec": expanded_end,
+                "peak_energy": float(span["peak_energy"]),
+                "trigger": str(span["trigger"]),
+            }
+        )
+
+    merged: list[dict[str, float | str]] = []
+    for span in expanded_spans:
+        start = float(span["start_sec"])
+        end = float(span["end_sec"])
+        peak_energy = float(span["peak_energy"])
+        if not merged:
+            merged.append(
+                {
+                    "start_sec": start,
+                    "end_sec": end,
+                    "peak_energy": peak_energy,
+                    "trigger": "motion_energy",
+                }
+            )
+            continue
+
+        gap = start - float(merged[-1]["end_sec"])
+        if gap <= merge_gap_sec:
+            merged[-1]["end_sec"] = max(float(merged[-1]["end_sec"]), end)
+            merged[-1]["peak_energy"] = max(float(merged[-1]["peak_energy"]), peak_energy)
+        else:
+            merged.append(
+                {
+                    "start_sec": start,
+                    "end_sec": end,
+                    "peak_energy": peak_energy,
+                    "trigger": "motion_energy",
+                }
+            )
+
+    adjusted: list[dict[str, float | str]] = []
+    for span in merged:
+        start, end = _enforce_duration(
+            float(span["start_sec"]),
+            float(span["end_sec"]),
+            min_segment_sec,
+            max_segment_sec,
+            video_end_sec,
+        )
+        adjusted.append(
+            {
+                "start_sec": start,
+                "end_sec": end,
+                "peak_energy": float(span["peak_energy"]),
+                "trigger": str(span["trigger"]),
+            }
+        )
+
+    non_overlapping: list[dict[str, float | str]] = []
+    for span in adjusted:
+        start = float(span["start_sec"])
+        end = float(span["end_sec"])
+        peak_energy = float(span["peak_energy"])
+        trigger = str(span["trigger"])
+        if not non_overlapping:
+            if end > start:
+                non_overlapping.append(
+                    {
+                        "start_sec": start,
+                        "end_sec": end,
+                        "peak_energy": peak_energy,
+                        "trigger": trigger,
+                    }
+                )
+            continue
+
+        prev_end = float(non_overlapping[-1]["end_sec"])
+        if start < prev_end:
+            start = prev_end
+
+        duration = end - start
+        if duration < min_segment_sec:
+            end = min(video_end_sec, start + min_segment_sec)
+            duration = end - start
+
+        if duration > max_segment_sec:
+            end = start + max_segment_sec
+
+        if end <= start:
+            continue
+
+        non_overlapping.append(
+            {
+                "start_sec": round(start, 6),
+                "end_sec": round(min(end, video_end_sec), 6),
+                "peak_energy": peak_energy,
+                "trigger": trigger,
+            }
+        )
+
+    if video_end_sec <= 15.0:
+        late_start = max(0.0, video_end_sec - 4.0)
+        late_end = video_end_sec
+        has_late_overlap = any(
+            _overlaps(float(seg["start_sec"]), float(seg["end_sec"]), late_start, late_end)
+            for seg in non_overlapping
+        )
+        if not has_late_overlap and late_end > late_start:
+            late_start, late_end = _enforce_duration(
+                late_start,
+                late_end,
+                min_segment_sec,
+                max_segment_sec,
+                video_end_sec,
+            )
+            non_overlapping.append(
+                {
+                    "start_sec": late_start,
+                    "end_sec": late_end,
+                    "peak_energy": _max_peak_within_range(series, late_start, late_end),
+                    "trigger": "late_window",
+                }
+            )
+            non_overlapping = sorted(non_overlapping, key=lambda item: float(item["start_sec"]))
+            deduped: list[dict[str, float | str]] = []
+            for seg in non_overlapping:
+                if not deduped:
+                    deduped.append(seg)
+                    continue
+                if _overlaps(
+                    float(deduped[-1]["start_sec"]),
+                    float(deduped[-1]["end_sec"]),
+                    float(seg["start_sec"]),
+                    float(seg["end_sec"]),
+                ):
+                                                                                                                
+                    continue
+                deduped.append(seg)
+            non_overlapping = deduped
+
+    non_overlapping = _inject_mid_window_if_missing(
+        segments=non_overlapping,
+        series=series,
+        min_segment_sec=min_segment_sec,
+        max_segment_sec=max_segment_sec,
+        video_end_sec=video_end_sec,
+    )
+
+    focus_start = video_end_sec * 0.4
+    focus_end = video_end_sec * 0.9
+    has_focus_overlap = any(
+        _overlaps(float(seg["start_sec"]), float(seg["end_sec"]), focus_start, focus_end)
+        for seg in non_overlapping
+    )
+    if not has_focus_overlap and video_end_sec > 0:
+        non_overlapping = [
+            {
+                "start_sec": 0.0,
+                "end_sec": round(video_end_sec, 6),
+                "peak_energy": max(energies) if energies else 0.0,
+                "trigger": "fallback_full_clip",
+            }
+        ]
+
+    late_window_segments = [seg for seg in non_overlapping if str(seg["trigger"]) == "late_window"]
+    non_late_segments = [seg for seg in non_overlapping if str(seg["trigger"]) != "late_window"]
+
+    ranked_non_late = sorted(
+        non_late_segments,
+        key=lambda item: (-float(item["peak_energy"]), float(item["start_sec"])),
+    )
+
+    selected: list[dict[str, float | str]] = []
+    if late_window_segments:
+                                                                      
+        selected.append(late_window_segments[0])
+        remaining_slots = max(0, max_segments - 1)
+    else:
+        remaining_slots = max_segments
+
+    selected.extend(ranked_non_late[:remaining_slots])
+    selected = sorted(selected, key=lambda item: float(item["start_sec"]))
+
+    segments: list[dict[str, float | str]] = []
+    for idx, segment in enumerate(selected, start=1):
+        start = float(segment["start_sec"])
+        end = float(segment["end_sec"])
+        if end <= start:
+            continue
+        segments.append(
+            {
+                "segment_id": f"s{idx}",
+                "start_sec": round(start, 6),
+                "end_sec": round(end, 6),
+                "trigger": str(segment["trigger"]),
+                "peak_energy": round(float(segment["peak_energy"]), 6),
+            }
+        )
+
+    return segments
+
+
+def save_segments_csv(segments: list[dict[str, float | str]], out_csv_path: str | Path) -> None:
+
+    out_path = Path(out_csv_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with out_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=["segment_id", "start_sec", "end_sec", "trigger", "peak_energy"],
+        )
+        writer.writeheader()
+        for segment in segments:
+            writer.writerow(segment)

@@ -1,0 +1,132 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import cv2
+
+
+def probe_video(video_path: str | Path) -> dict[str, float | int]:
+
+    video = Path(video_path)
+    if not video.exists() or not video.is_file():
+        raise FileNotFoundError(f"Video not found: {video}")
+
+    capture = cv2.VideoCapture(str(video))
+    if not capture.isOpened():
+        raise ValueError(f"Unable to open video: {video}")
+
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        capture.release()
+
+    if fps <= 0:
+        raise ValueError(f"Video reports invalid FPS ({fps}): {video}")
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Video reports invalid dimensions ({width}x{height}): {video}")
+
+    duration_sec = (frame_count / fps) if frame_count > 0 else 0.0
+    return {
+        "fps": fps,
+        "frame_count": frame_count,
+        "duration_sec": duration_sec,
+        "width": width,
+        "height": height,
+    }
+
+
+def _resize_keep_aspect(frame: cv2.typing.MatLike, short_side_resize: int) -> cv2.typing.MatLike:
+    if short_side_resize <= 0:
+        raise ValueError("short_side_resize must be greater than 0")
+
+    height, width = frame.shape[:2]
+    short_side = min(height, width)
+    if short_side <= 0:
+        raise ValueError("Invalid frame dimensions during resize")
+
+    scale = short_side_resize / short_side
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+
+    if new_width == width and new_height == height:
+        return frame
+    return cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+
+def extract_sampled_frames(
+    video_path: str | Path,
+    out_dir: str | Path,
+    sample_fps: float = 2.0,
+    short_side_resize: int = 640,
+) -> list[dict[str, float | int | str]]:
+
+    if sample_fps <= 0:
+        raise ValueError("sample_fps must be greater than 0")
+
+    video = Path(video_path)
+    if not video.exists() or not video.is_file():
+        raise FileNotFoundError(f"Video not found: {video}")
+
+    output_dir = Path(out_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for stale_file in sorted(output_dir.glob("f_*.jpg")):
+        stale_file.unlink()
+
+    capture = cv2.VideoCapture(str(video))
+    if not capture.isOpened():
+        raise ValueError(f"Unable to open video: {video}")
+
+    fps = float(capture.get(cv2.CAP_PROP_FPS))
+    if fps <= 0:
+        capture.release()
+        raise ValueError(f"Video reports invalid FPS ({fps}): {video}")
+
+    sampled_frames: list[dict[str, float | int | str]] = []
+    frame_index = 0
+    frame_id = 0
+    next_sample_time = 0.0
+
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+
+            time_sec = frame_index / fps
+            if time_sec + 1e-9 >= next_sample_time:
+                resized = _resize_keep_aspect(frame, short_side_resize)
+                frame_path = output_dir / f"f_{frame_id:06d}.jpg"
+                written = cv2.imwrite(
+                    str(frame_path),
+                    resized,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 95],
+                )
+                if not written:
+                    raise ValueError(f"Failed to write frame image: {frame_path}")
+
+                out_height, out_width = resized.shape[:2]
+                sampled_frames.append(
+                    {
+                        "frame_id": frame_id,
+                        "orig_frame_idx": frame_index,
+                        "time_sec": round(time_sec, 6),
+                        "path": str(frame_path),
+                        "width": int(out_width),
+                        "height": int(out_height),
+                    }
+                )
+                frame_id += 1
+                next_sample_time = frame_id / sample_fps
+
+            frame_index += 1
+    finally:
+        capture.release()
+
+    if not sampled_frames:
+        raise ValueError(f"No frames sampled from video: {video}")
+
+    return sorted(sampled_frames, key=lambda item: int(item["frame_id"]))

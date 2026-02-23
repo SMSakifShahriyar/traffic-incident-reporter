@@ -1,0 +1,134 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src import cli
+from src import detect_track
+from src.detect_track import assign_actor_roles_from_tracks, summarize_tracks_for_segment
+
+
+def test_summarize_tracks_for_segment_from_fixture_csv(tmp_path: Path) -> None:
+    csv_path = tmp_path / "tracks.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2",
+                "0,0.0,1,0,person,0.90,0,0,10,10",
+                "1,0.5,1,0,person,0.85,1,1,11,11",
+                "2,1.0,2,2,car,0.88,2,2,12,12",
+                "3,1.5,2,2,car,0.92,3,3,13,13",
+                "4,2.5,3,2,car,0.80,4,4,14,14",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    summary = summarize_tracks_for_segment(str(csv_path), start_sec=0.25, end_sec=2.0)
+    assert summary["unique_track_ids"] == 2
+    assert summary["class_counts"]["person"] == 1
+    assert summary["class_counts"]["car"] == 2
+    assert len(summary["tracks"]) >= 2
+
+
+def test_actor_role_mapping_from_track_class() -> None:
+    assert assign_actor_roles_from_tracks("person") == "pedestrian"
+    assert assign_actor_roles_from_tracks("car") == "car"
+    assert assign_actor_roles_from_tracks("truck") == "truck"
+    assert assign_actor_roles_from_tracks("unknown_thing") == "unknown"
+
+
+def test_detecttrack_cli_argument_parsing() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "detecttrack",
+            "--video",
+            "data/raw_videos/cctv_006.mp4",
+            "--out-dir",
+            "data/outputs",
+            "--model",
+            "yolo11n.pt",
+            "--tracker",
+            "botsort.yaml",
+            "--conf",
+            "0.2",
+            "--iou",
+            "0.45",
+            "--classes",
+            "person,car,truck",
+            "--save-annotated",
+            "false",
+        ]
+    )
+    assert args.command == "detecttrack"
+    assert args.video.endswith("cctv_006.mp4")
+    assert args.tracker == "botsort.yaml"
+    assert abs(args.conf - 0.2) < 1e-9
+    assert args.save_annotated == "false"
+
+
+def test_detecttrack_cli_with_mock(monkeypatch, capsys, tmp_path: Path) -> None:
+    video_path = tmp_path / "demo.mp4"
+    video_path.write_bytes(b"fake")
+
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "detecttrack",
+            "--video",
+            str(video_path),
+            "--out-dir",
+            str(tmp_path),
+            "--classes",
+            "person,car",
+        ]
+    )
+
+    def _fake_run_detect_track(**kwargs):
+        assert kwargs["video_path"] == str(video_path)
+        return {
+            "tracks_csv": str(tmp_path / "demo_tracks.csv"),
+            "summary_json": str(tmp_path / "demo_tracks_summary.json"),
+            "annotated_video": str(tmp_path / "demo_annotated.mp4"),
+            "num_tracks": 4,
+            "num_detections": 42,
+        }
+
+    monkeypatch.setattr(cli, "run_detect_track", _fake_run_detect_track)
+    args.func(args)
+    out = capsys.readouterr().out
+    assert "DETECTTRACK_OK" in out
+    assert "detections=42" in out
+    assert "tracks=4" in out
+
+
+def test_codec_candidates_windows_prefers_mp4v(monkeypatch) -> None:
+    monkeypatch.delenv("TIR_ANNOTATED_CODECS", raising=False)
+    monkeypatch.setattr(detect_track.platform, "system", lambda: "Windows")
+    codecs = detect_track._codec_candidates_for_platform()
+    assert codecs[0] == "mp4v"
+
+
+def test_codec_candidates_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("TIR_ANNOTATED_CODECS", "avc1,mp4v")
+    codecs = detect_track._codec_candidates_for_platform()
+    assert codecs == ["avc1", "mp4v"]
+
+
+def test_annotated_targets_windows_prefers_mp4_first(monkeypatch) -> None:
+    monkeypatch.delenv("TIR_ANNOTATED_CODECS", raising=False)
+    monkeypatch.setattr(detect_track.platform, "system", lambda: "Windows")
+    targets = detect_track._annotated_targets_for_platform()
+    assert targets[0] == (".mp4", "mp4v")
+
+
+def test_annotated_targets_include_webm_when_overridden(monkeypatch) -> None:
+    monkeypatch.setenv("TIR_ANNOTATED_CODECS", "VP80,mp4v")
+    targets = detect_track._annotated_targets_for_platform()
+    assert (".webm", "VP80") in targets

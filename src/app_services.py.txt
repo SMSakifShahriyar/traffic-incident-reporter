@@ -1,0 +1,2320 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+from hashlib import sha1
+from functools import lru_cache
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from .assemble import build_incident_report, build_report_filename, save_report_json
+from .config import load_app_config
+from .detect_track import assign_actor_roles_from_tracks
+from .detect_track import run_detect_track as run_detect_track_core
+from .detect_track import summarize_tracks_for_segment
+from .ingest import extract_sampled_frames, probe_video
+from .perception import load_segments_csv as load_segments_records
+from .perception import perceive_segments
+from .schema import IncidentReport
+from .segment import build_energy_series, propose_candidate_segments, save_segments_csv
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+
+RAW_VIDEOS_DIR = Path("data") / "raw_videos"
+FRAME_CACHE_DIR = Path("data") / "frame_cache"
+OUTPUTS_DIR = Path("data") / "outputs"
+REPORTS_DIR = OUTPUTS_DIR / "reports"
+REVIEWED_DIR = REPORTS_DIR / "reviewed"
+RENDERED_FRAMES_DIR = OUTPUTS_DIR / "_rendered_frames"
+FRAME_ID_PATTERN = re.compile(r"f_(\d+)\.(?:jpg|jpeg|png)$", re.IGNORECASE)
+DEPRECATED_REPEAT_PATTERN = re.compile(r"_(collision|near_miss|obstruction|violation|none)_\1_", re.IGNORECASE)
+
+
+def ensure_dirs() -> None:
+
+    for directory in (RAW_VIDEOS_DIR, FRAME_CACHE_DIR, OUTPUTS_DIR, REPORTS_DIR, REVIEWED_DIR, RENDERED_FRAMES_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+def _normalized_path(path: str | Path) -> str:
+    return str(Path(path).resolve(strict=False))
+
+
+def _meta_path_for_perception(perception_json: str | Path) -> Path:
+    target = Path(perception_json)
+    return Path(f"{target}.meta.json")
+
+
+def _clip_stem(video_path: str | Path) -> str:
+    stem = Path(video_path).stem.strip()
+    return stem or "clip"
+
+
+def cleanup_clip_outputs(video_path: str | Path, outputs_dir: str | Path) -> dict[str, Any]:
+
+    clip_stem = _clip_stem(video_path)
+    outputs = Path(outputs_dir)
+    removed_files = 0
+    removed_dirs = 0
+
+    targets: list[Path] = [
+        outputs / f"{clip_stem}_frames.json",
+        outputs / f"{clip_stem}_energy.json",
+        outputs / f"{clip_stem}_segments.csv",
+        outputs / f"{clip_stem}_perception.json",
+        outputs / f"{clip_stem}_perception_manual.json",
+        outputs / f"{clip_stem}_involvement.json",
+        outputs / f"{clip_stem}_tracks.csv",
+        outputs / f"{clip_stem}_tracks_summary.json",
+        outputs / f"{clip_stem}_annotated.mp4",
+        outputs / f"{clip_stem}_annotated.avi",
+        outputs / f"{clip_stem}_annotated.webm",
+        Path(f"{outputs / f'{clip_stem}_perception.json'}.meta.json"),
+    ]
+
+    for path in targets:
+        if path.exists() and path.is_file():
+            try:
+                path.unlink()
+                removed_files += 1
+            except Exception:
+                pass
+
+    reports_dir = outputs / "reports"
+    if reports_dir.exists():
+        for report_path in reports_dir.glob(f"{clip_stem}_*_report.json"):
+            try:
+                report_path.unlink()
+                removed_files += 1
+            except Exception:
+                pass
+
+    frame_cache_dir = FRAME_CACHE_DIR / clip_stem
+    if frame_cache_dir.exists() and frame_cache_dir.is_dir():
+        try:
+            shutil.rmtree(frame_cache_dir)
+            removed_dirs += 1
+        except Exception:
+            pass
+
+    return {
+        "clip_stem": clip_stem,
+        "removed_files": removed_files,
+        "removed_dirs": removed_dirs,
+    }
+
+
+def _read_frames_payload(frames_json: str | Path) -> tuple[list[dict[str, Any]], str]:
+    payload = load_json(frames_json)
+    if isinstance(payload, dict):
+        frames = payload.get("frames")
+        if not isinstance(frames, list):
+            raise ValueError(f"Frames JSON missing list under 'frames': {frames_json}")
+        source_video = str(payload.get("video_path", "")).strip()
+        return (frames, source_video)
+
+    if isinstance(payload, list):
+        return (payload, "")
+
+    raise ValueError(f"Unsupported frames JSON payload: {frames_json}")
+
+
+def _frame_idx_from_path(path: str | Path) -> int | None:
+    filename = Path(path).name
+    match = FRAME_ID_PATTERN.search(filename)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _normalize_compare_path(path: str | Path) -> str:
+    try:
+        return str(Path(path).resolve(strict=False)).lower()
+    except Exception:
+        return str(path).replace("\\", "/").lower()
+
+
+def _extract_track_source_from_notes(notes: str) -> str | None:
+    raw = str(notes)
+    match = re.search(r"(?:^|;)track_source=([^;]+)", raw)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    return value or None
+
+
+@lru_cache(maxsize=64)
+def _frames_index_cache(frames_json_path: str) -> dict[str, Any]:
+    payload = load_json(frames_json_path)
+    frames: list[dict[str, Any]] = []
+    probe_fps: float | None = None
+    if isinstance(payload, dict):
+        maybe_frames = payload.get("frames", [])
+        if isinstance(maybe_frames, list):
+            frames = [item for item in maybe_frames if isinstance(item, dict)]
+        probe = payload.get("probe", {})
+        if isinstance(probe, dict):
+            fps_val = probe.get("fps")
+            if isinstance(fps_val, (int, float)):
+                probe_fps = float(fps_val)
+    elif isinstance(payload, list):
+        frames = [item for item in payload if isinstance(item, dict)]
+
+    by_path: dict[str, dict[str, Any]] = {}
+    by_sample_idx: dict[int, dict[str, Any]] = {}
+    for row in frames:
+        maybe_path = row.get("path")
+        if isinstance(maybe_path, str) and maybe_path.strip():
+            by_path[_normalize_compare_path(maybe_path)] = row
+        frame_id = row.get("frame_id")
+        if isinstance(frame_id, int):
+            by_sample_idx[int(frame_id)] = row
+
+    return {"by_path": by_path, "by_sample_idx": by_sample_idx, "probe_fps": probe_fps}
+
+
+def resolve_video_input(path_or_upload: Any) -> str:
+
+    ensure_dirs()
+
+    if isinstance(path_or_upload, (str, Path)):
+        path = Path(path_or_upload)
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"Video file not found: {path}")
+        return str(path)
+
+    if hasattr(path_or_upload, "getbuffer") or hasattr(path_or_upload, "read"):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = RAW_VIDEOS_DIR / f"uploaded_{timestamp}.mp4"
+        if hasattr(path_or_upload, "getbuffer"):
+            out_path.write_bytes(bytes(path_or_upload.getbuffer()))
+        else:
+            raw = path_or_upload.read()
+            if not isinstance(raw, (bytes, bytearray)):
+                raise ValueError("Uploaded file object did not return bytes")
+            out_path.write_bytes(bytes(raw))
+        return str(out_path)
+
+    raise ValueError("Unsupported video input. Provide a local path or uploaded file object.")
+
+
+def run_ingest_segment(video_path: str, outputs_dir: str) -> dict[str, Any]:
+
+    ensure_dirs()
+    video = Path(video_path)
+    if not video.exists() or not video.is_file():
+        raise FileNotFoundError(f"Video file not found: {video}")
+
+    config = load_app_config()
+    clip_stem = _clip_stem(video)
+
+    outputs = Path(outputs_dir)
+    outputs.mkdir(parents=True, exist_ok=True)
+    cache_dir = FRAME_CACHE_DIR / clip_stem
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    video_meta = probe_video(video)
+    sampled_frames = extract_sampled_frames(
+        video_path=video,
+        out_dir=cache_dir,
+        sample_fps=config.frame_sample_fps,
+        short_side_resize=config.short_side_resize,
+    )
+
+    frames_json_path = outputs / f"{clip_stem}_frames.json"
+    segments_csv_path = outputs / f"{clip_stem}_segments.csv"
+    energy_json_path = outputs / f"{clip_stem}_energy.json"
+
+    frames_payload = {
+        "video_path": str(video),
+        "probe": video_meta,
+        "frames": sampled_frames,
+    }
+    frames_json_path.write_text(json.dumps(frames_payload, indent=2), encoding="utf-8")
+
+    energy_series = build_energy_series(sampled_frames)
+    segments = propose_candidate_segments(
+        energy_series=energy_series,
+        min_segment_sec=config.min_segment_sec,
+        max_segment_sec=config.max_segment_sec,
+        threshold_quantile=config.energy_threshold_quantile,
+        merge_gap_sec=config.merge_gap_sec,
+        max_segments=3,
+    )
+    save_segments_csv(segments, segments_csv_path)
+    energy_json_path.write_text(json.dumps(energy_series, indent=2), encoding="utf-8")
+
+    return {
+        "frames_json": str(frames_json_path),
+        "segments_csv": str(segments_csv_path),
+        "segment_count": len(segments),
+    }
+
+
+def should_reuse_perception(
+    perception_json: str | Path,
+    video_path: str | Path,
+    segments_csv: str | Path,
+    model: str,
+    max_frames: int,
+) -> bool:
+
+    result_path = Path(perception_json)
+    sidecar_path = _meta_path_for_perception(result_path)
+    if not result_path.exists() or not sidecar_path.exists():
+        return False
+
+    try:
+        meta = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    expected = {
+        "video_path": _normalized_path(video_path),
+        "segments_csv": _normalized_path(segments_csv),
+        "model": str(model),
+        "max_frames": int(max_frames),
+    }
+    return all(meta.get(key) == value for key, value in expected.items())
+
+
+def run_perceive(
+    frames_json: str,
+    segments_csv: str,
+    out_json: str,
+    model: str,
+    max_frames: int,
+    force: bool = False,
+) -> dict[str, Any]:
+
+    ensure_dirs()
+    frames_path = Path(frames_json)
+    segments_path = Path(segments_csv)
+    out_path = Path(out_json)
+
+    if not frames_path.exists() or not frames_path.is_file():
+        raise FileNotFoundError(f"Frames JSON not found: {frames_path}")
+    if not segments_path.exists() or not segments_path.is_file():
+        raise FileNotFoundError(f"Segments CSV not found: {segments_path}")
+
+    max_frames_clamped = max(2, min(12, int(max_frames)))
+    frames, source_video = _read_frames_payload(frames_path)
+
+    if not source_video:
+        source_video = str(frames_path)
+
+    if not force and should_reuse_perception(
+        perception_json=out_path,
+        video_path=source_video,
+        segments_csv=segments_path,
+        model=model,
+        max_frames=max_frames_clamped,
+    ):
+        cached = load_json(out_path)
+        cached_list = cached if isinstance(cached, list) else []
+        ok_count = sum(1 for item in cached_list if isinstance(item, dict) and item.get("status") == "ok")
+        return {
+            "perception_json": str(out_path),
+            "ok": ok_count,
+            "failed": len(cached_list) - ok_count,
+            "reused_cache": True,
+        }
+
+    if not os.getenv("OPENAI_API_KEY", "").strip():
+        raise ValueError("OPENAI_API_KEY is missing. Set it before running perception.")
+
+    prompt_path = Path("prompts") / "perception.txt"
+    if not prompt_path.exists() or not prompt_path.is_file():
+        raise FileNotFoundError(f"Perception prompt not found: {prompt_path}")
+
+    prompt_text = prompt_path.read_text(encoding="utf-8").strip()
+    segments = load_segments_records(segments_path)
+
+    results = perceive_segments(
+        frames=frames,
+        segments=segments,
+        prompt_text=prompt_text,
+        model=model,
+        max_frames=max_frames_clamped,
+        max_retries=2,
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+
+    sidecar = {
+        "video_path": _normalized_path(source_video),
+        "segments_csv": _normalized_path(segments_path),
+        "model": str(model),
+        "max_frames": int(max_frames_clamped),
+        "created_at": datetime.now().isoformat(),
+    }
+    _meta_path_for_perception(out_path).write_text(json.dumps(sidecar, indent=2), encoding="utf-8")
+
+    ok_count = sum(1 for item in results if isinstance(item, dict) and item.get("status") == "ok")
+    return {
+        "perception_json": str(out_path),
+        "ok": ok_count,
+        "failed": len(results) - ok_count,
+        "reused_cache": False,
+    }
+
+
+def run_assemble(
+    perception_json: str,
+    source_video: str,
+    out_dir: str,
+    enhance_claims: bool = False,
+    writer_model: str = "gpt-4.1",
+    writer_max_frames: int = 8,
+    writer_max_retries: int = 2,
+    require_claim_writer: bool = False,
+) -> dict[str, Any]:
+
+    ensure_dirs()
+    perception_path = Path(perception_json)
+    if not perception_path.exists() or not perception_path.is_file():
+        raise FileNotFoundError(f"Perception JSON not found: {perception_path}")
+
+    payload = load_json(perception_path)
+    if not isinstance(payload, list):
+        raise ValueError("Perception JSON must be a list of segment-level items")
+
+    output_dir = Path(out_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    video_stem = Path(source_video).stem or "clip"
+    tracks_csv_candidate = Path(perception_json).parent / f"{video_stem}_tracks.csv"
+    tracks_csv_path = tracks_csv_candidate if tracks_csv_candidate.exists() else None
+    sidecar_model_name: str | None = None
+    sidecar_path = _meta_path_for_perception(perception_path)
+    if sidecar_path.exists():
+        try:
+            sidecar_payload = load_json(sidecar_path)
+        except Exception:
+            sidecar_payload = {}
+        if isinstance(sidecar_payload, dict):
+            raw_model = str(sidecar_payload.get("model", "")).strip()
+            sidecar_model_name = raw_model or None
+
+    report_paths: list[str] = []
+    failed = 0
+    for item in payload:
+        if not isinstance(item, dict):
+            failed += 1
+            continue
+        try:
+            track_segment_summary = None
+            if tracks_csv_path is not None:
+                start_sec = float(item.get("start_sec", 0.0))
+                end_sec = float(item.get("end_sec", start_sec))
+                track_segment_summary = summarize_tracks_for_segment(
+                    tracks_csv_path=str(tracks_csv_path),
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                )
+            report_item = dict(item)
+            if sidecar_model_name and not str(report_item.get("model_name", "")).strip():
+                report_item["model_name"] = sidecar_model_name
+            if sidecar_model_name and not str(report_item.get("model", "")).strip():
+                report_item["model"] = sidecar_model_name
+
+            report = build_incident_report(
+                report_item,
+                source_video=source_video,
+                track_segment_summary=track_segment_summary,
+                track_source=str(tracks_csv_path) if tracks_csv_path else None,
+                enhance_claims_with_ai=bool(enhance_claims),
+                claim_writer_model=str(writer_model),
+                claim_writer_max_frames=int(writer_max_frames),
+                claim_writer_max_retries=int(writer_max_retries),
+                require_ai_claims=bool(require_claim_writer),
+            )
+            segment_id = str(item.get("segment_id", "seg")).strip() or "seg"
+            filename = build_report_filename(video_stem, segment_id, report.overall_assessment.event_type.value)
+            out_path = output_dir / filename
+            save_report_json(report, out_path)
+            report_paths.append(str(out_path))
+        except Exception:
+            failed += 1
+
+    return {
+        "report_paths": report_paths,
+        "ok": len(report_paths),
+        "failed": failed,
+    }
+
+
+def run_full_pipeline(
+    video_path: str,
+    outputs_dir: str,
+    model: str,
+    max_frames: int,
+    force: bool = False,
+    manual_segments_csv: str | None = None,
+) -> dict[str, Any]:
+
+    ingest_result = run_ingest_segment(video_path=video_path, outputs_dir=outputs_dir)
+
+    clip_stem = _clip_stem(video_path)
+    segments_csv = ingest_result["segments_csv"]
+    if manual_segments_csv:
+        manual_path = Path(manual_segments_csv)
+        if manual_path.exists() and manual_path.is_file():
+            segments_csv = str(manual_path)
+
+    perception_out = str(Path(outputs_dir) / f"{clip_stem}_perception.json")
+    perceive_result = run_perceive(
+        frames_json=ingest_result["frames_json"],
+        segments_csv=segments_csv,
+        out_json=perception_out,
+        model=model,
+        max_frames=max_frames,
+        force=force,
+    )
+
+    assemble_result = run_assemble(
+        perception_json=perceive_result["perception_json"],
+        source_video=video_path,
+        out_dir=str(Path(outputs_dir) / "reports"),
+    )
+
+    return {
+        "frames_json": ingest_result["frames_json"],
+        "segments_csv": segments_csv,
+        "segment_count": ingest_result["segment_count"],
+        "perception_json": perceive_result["perception_json"],
+        "perception_ok": perceive_result["ok"],
+        "perception_failed": perceive_result["failed"],
+        "reused_cache": perceive_result["reused_cache"],
+        "report_paths": assemble_result["report_paths"],
+        "assemble_ok": assemble_result["ok"],
+        "assemble_failed": assemble_result["failed"],
+    }
+
+
+def _extract_report_selection_features(report_path: str) -> dict[str, float]:
+
+    empty = {
+        "max_collision": 0.0,
+        "max_near_miss": 0.0,
+        "max_obstruction": 0.0,
+        "max_violation": 0.0,
+        "max_any": 0.0,
+        "collision_count": 0.0,
+        "near_miss_count": 0.0,
+        "obstruction_count": 0.0,
+        "violation_count": 0.0,
+        "non_collision_count": 0.0,
+        "claim_count": 0.0,
+        "start_sec": 1e6,
+        "end_sec": 1e6,
+        "mid_sec": 1e6,
+    }
+    try:
+        payload = load_json(report_path)
+    except Exception:
+        return empty
+    if not isinstance(payload, dict):
+        return empty
+    segments = payload.get("segments", [])
+    segment = segments[0] if isinstance(segments, list) and segments and isinstance(segments[0], dict) else {}
+    claims = segment.get("claims", [])
+    if not isinstance(claims, list):
+        claims = []
+
+    max_collision = 0.0
+    max_near_miss = 0.0
+    max_obstruction = 0.0
+    max_violation = 0.0
+    max_any = 0.0
+    collision_count = 0
+    near_miss_count = 0
+    obstruction_count = 0
+    violation_count = 0
+
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        conf = float(claim.get("support_confidence", 0.0))
+        event = str(claim.get("event_type", "")).strip().lower()
+        max_any = max(max_any, conf)
+        if event == "collision":
+            max_collision = max(max_collision, conf)
+            collision_count += 1
+        if event == "near_miss":
+            max_near_miss = max(max_near_miss, conf)
+            near_miss_count += 1
+        if event == "obstruction":
+            max_obstruction = max(max_obstruction, conf)
+            obstruction_count += 1
+        if event == "violation":
+            max_violation = max(max_violation, conf)
+            violation_count += 1
+
+    claim_count = len([claim for claim in claims if isinstance(claim, dict)])
+    non_collision_count = max(0, claim_count - collision_count)
+    try:
+        start_sec = float(segment.get("start_sec", 1e6))
+        end_sec = float(segment.get("end_sec", start_sec))
+    except Exception:
+        start_sec = 1e6
+        end_sec = 1e6
+    mid_sec = (start_sec + end_sec) / 2.0 if start_sec < 1e5 and end_sec < 1e5 else 1e6
+
+    return {
+        "max_collision": float(max_collision),
+        "max_near_miss": float(max_near_miss),
+        "max_obstruction": float(max_obstruction),
+        "max_violation": float(max_violation),
+        "max_any": float(max_any),
+        "collision_count": float(collision_count),
+        "near_miss_count": float(near_miss_count),
+        "obstruction_count": float(obstruction_count),
+        "violation_count": float(violation_count),
+        "non_collision_count": float(non_collision_count),
+        "claim_count": float(claim_count),
+        "start_sec": float(start_sec),
+        "end_sec": float(end_sec),
+        "mid_sec": float(mid_sec),
+    }
+
+
+def score_report_for_selection(report_path: str, clip_mid_sec: float | None = None) -> tuple[float, ...]:
+
+    f = _extract_report_selection_features(report_path)
+
+    max_collision = f["max_collision"]
+    max_near_miss = f["max_near_miss"]
+    max_obstruction = f["max_obstruction"]
+    max_violation = f["max_violation"]
+    max_any = f["max_any"]
+    collision_count = f["collision_count"]
+    near_miss_count = f["near_miss_count"]
+    obstruction_count = f["obstruction_count"]
+    violation_count = f["violation_count"]
+    non_collision_count = f["non_collision_count"]
+    claim_count = max(1.0, f["claim_count"])
+    start_sec = f["start_sec"]
+    mid_sec = f["mid_sec"]
+
+    proximity = -1e6
+    if clip_mid_sec is not None and mid_sec < 1e5:
+        proximity = -abs(mid_sec - float(clip_mid_sec))
+
+    collision_focus_ratio = collision_count / claim_count
+    near_miss_focus_ratio = near_miss_count / claim_count
+    obstruction_focus_ratio = obstruction_count / claim_count
+    violation_focus_ratio = violation_count / claim_count
+
+                                                                                     
+    priority_bucket = 0.0
+    dominant_conf = max_any
+    dominant_focus = 0.0
+    dominant_count = 0.0
+    if max_collision > 0.0:
+        priority_bucket = 4.0
+        dominant_conf = max_collision
+        dominant_focus = collision_focus_ratio
+        dominant_count = collision_count
+    elif max_near_miss > 0.0:
+        priority_bucket = 3.0
+        dominant_conf = max_near_miss
+        dominant_focus = near_miss_focus_ratio
+        dominant_count = near_miss_count
+    elif max_obstruction > 0.0:
+        priority_bucket = 2.0
+        dominant_conf = max_obstruction
+        dominant_focus = obstruction_focus_ratio
+        dominant_count = obstruction_count
+    elif max_violation > 0.0:
+        priority_bucket = 1.0
+        dominant_conf = max_violation
+        dominant_focus = violation_focus_ratio
+        dominant_count = violation_count
+
+                                                         
+    return (
+        float(priority_bucket),
+        float(dominant_conf),
+        float(dominant_focus),
+        float(dominant_count),
+        float(-non_collision_count),
+        float(-start_sec if start_sec < 1e5 else -1e6),
+        float(max_any),
+        float(proximity),
+    )
+
+
+def _score_report_for_selection(report_path: str) -> tuple[float, ...]:
+    return score_report_for_selection(report_path)
+
+
+def _select_primary_report_path(report_paths: list[str]) -> str | None:
+    if not report_paths:
+        return None
+    scored = sorted(
+        report_paths,
+        key=lambda path: _score_report_for_selection(path),
+        reverse=True,
+    )
+    return scored[0] if scored else None
+
+
+def run_full_fresh_rebuild(
+    video_path: str,
+    outputs_dir: str,
+    model: str = "gpt-4.1",
+    max_frames: int = 12,
+    tracker: str = "botsort.yaml",
+    conf: float = 0.25,
+    iou: float = 0.5,
+    classes: list[str] | None = None,
+    save_annotated: bool = True,
+    enhance_claims: bool = True,
+    writer_model: str = "gpt-4.1",
+    writer_max_frames: int = 12,
+    writer_max_retries: int = 2,
+    require_claim_writer: bool = False,
+    involvement_model: str = "gpt-4.1",
+    involvement_max_frames: int = 8,
+    involvement_use_ai: bool = True,
+) -> dict[str, Any]:
+
+    ensure_dirs()
+    video = Path(video_path)
+    if not video.exists() or not video.is_file():
+        raise FileNotFoundError(f"Video file not found: {video}")
+    if not os.getenv("OPENAI_API_KEY", "").strip():
+        raise ValueError("OPENAI_API_KEY is missing. Set it before running full rebuild.")
+
+    outputs = Path(outputs_dir)
+    outputs.mkdir(parents=True, exist_ok=True)
+    clip_stem = _clip_stem(video)
+
+    cleanup_result = cleanup_clip_outputs(video, outputs)
+    ingest_result = run_ingest_segment(video_path=str(video), outputs_dir=str(outputs))
+    detect_result = run_detecttrack(
+        video_path=str(video),
+        outputs_dir=str(outputs),
+        model_name=None,
+        tracker=tracker,
+        conf=float(conf),
+        iou=float(iou),
+        classes=classes if classes else ["person", "bicycle", "car", "motorcycle", "bus", "truck"],
+        save_annotated=bool(save_annotated),
+    )
+    tracks_csv_path = Path(str(detect_result.get("tracks_csv", outputs / f"{clip_stem}_tracks.csv")))
+    if not tracks_csv_path.exists():
+                                                                               
+                                                               
+        tracks_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        tracks_csv_path.write_text(
+            "frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2\n",
+            encoding="utf-8",
+        )
+    detect_result["tracks_csv"] = str(tracks_csv_path)
+
+    perception_path = outputs / f"{clip_stem}_perception.json"
+    perceive_result = run_perceive(
+        frames_json=ingest_result["frames_json"],
+        segments_csv=ingest_result["segments_csv"],
+        out_json=str(perception_path),
+        model=model,
+        max_frames=max_frames,
+        force=True,
+    )
+
+    assemble_result = run_assemble(
+        perception_json=perceive_result["perception_json"],
+        source_video=str(video),
+        out_dir=str(outputs / "reports"),
+        enhance_claims=bool(enhance_claims),
+        writer_model=writer_model,
+        writer_max_frames=writer_max_frames,
+        writer_max_retries=writer_max_retries,
+        require_claim_writer=bool(require_claim_writer),
+    )
+
+    primary_report_path = _select_primary_report_path(assemble_result.get("report_paths", []))
+    involvement_result: dict[str, Any] | None = None
+    grounding_result: dict[str, Any] | None = None
+    involvement_path = outputs / f"{clip_stem}_involvement.json"
+    if primary_report_path and tracks_csv_path.exists():
+        from .involvement import run_involvement_for_report
+
+        involvement_result = run_involvement_for_report(
+            report_json_path=primary_report_path,
+            perception_json_path=str(perception_path),
+            frames_json_path=ingest_result["frames_json"],
+            tracks_csv_path=str(tracks_csv_path),
+            out_json_path=str(involvement_path),
+            model=involvement_model,
+            max_frames=involvement_max_frames,
+            max_retries=2,
+            use_ai=bool(involvement_use_ai),
+            prompt_path=str(Path("prompts") / "involvement.txt"),
+        )
+        try:
+            grounding_result = apply_grounded_claims_to_report(
+                report_json_path=primary_report_path,
+                involvement_json_path=str(involvement_path),
+            )
+        except Exception:
+            grounding_result = None
+
+    return {
+        "clip_stem": clip_stem,
+        "cleanup": cleanup_result,
+        "frames_json": ingest_result["frames_json"],
+        "segments_csv": ingest_result["segments_csv"],
+        "segment_count": ingest_result["segment_count"],
+        "tracks_csv": detect_result["tracks_csv"],
+        "tracks_summary_json": detect_result["summary_json"],
+        "annotated_video": detect_result["annotated_video"],
+        "num_tracks": detect_result["num_tracks"],
+        "num_detections": detect_result["num_detections"],
+        "perception_json": perceive_result["perception_json"],
+        "perception_ok": perceive_result["ok"],
+        "perception_failed": perceive_result["failed"],
+        "report_paths": assemble_result["report_paths"],
+        "assemble_ok": assemble_result["ok"],
+        "assemble_failed": assemble_result["failed"],
+        "primary_report_path": primary_report_path,
+        "involvement_json": involvement_result["out_json"] if isinstance(involvement_result, dict) else None,
+        "grounded_claim_updates": grounding_result["updated_claims"] if isinstance(grounding_result, dict) else 0,
+    }
+
+
+def load_segments_csv(path: str | Path) -> "pd.DataFrame":
+
+    import pandas as pd
+
+    csv_path = Path(path)
+    if not csv_path.exists() or not csv_path.is_file():
+        raise FileNotFoundError(f"Segments CSV not found: {csv_path}")
+    return pd.read_csv(csv_path)
+
+
+def load_tracks_csv(path: str | Path) -> "pd.DataFrame":
+
+    import pandas as pd
+
+    csv_path = Path(path)
+    if not csv_path.exists() or not csv_path.is_file():
+        raise FileNotFoundError(f"Tracks CSV not found: {csv_path}")
+    return pd.read_csv(csv_path)
+
+
+def load_json(path: str | Path) -> dict[str, Any] | list[Any]:
+
+    json_path = Path(path)
+    if not json_path.exists() or not json_path.is_file():
+        raise FileNotFoundError(f"JSON file not found: {json_path}")
+    try:
+        return json.loads(json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid JSON in {json_path}: {exc}") from exc
+
+
+def derive_actors_from_involvement(
+    report_json: dict[str, Any],
+    claim_involvement_map: dict[str, dict[str, Any]] | None,
+    tracks_csv_path: str | None,
+) -> list[dict[str, Any]]:
+
+    if not isinstance(report_json, dict) or not isinstance(claim_involvement_map, dict):
+        return []
+
+    segments = report_json.get("segments", [])
+    if not isinstance(segments, list) or not segments or not isinstance(segments[0], dict):
+        return []
+    claims = segments[0].get("claims", [])
+    if not isinstance(claims, list):
+        return []
+
+    ordered_track_ids: list[int] = []
+    seen_ids: set[int] = set()
+    direct_ids: set[int] = set()
+    secondary_ids_ordered: list[int] = []
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("claim_id", "")).strip()
+        if not claim_id:
+            continue
+        involvement = claim_involvement_map.get(claim_id, {})
+        if not isinstance(involvement, dict):
+            continue
+        primary_ids = involvement.get("primary_track_ids", [])
+        secondary_ids = involvement.get("secondary_track_ids", [])
+        if isinstance(primary_ids, list):
+            for raw_tid in primary_ids:
+                try:
+                    tid = int(raw_tid)
+                except Exception:
+                    continue
+                if tid < 0:
+                    continue
+                direct_ids.add(tid)
+                if tid not in seen_ids:
+                    seen_ids.add(tid)
+                    ordered_track_ids.append(tid)
+        if isinstance(secondary_ids, list):
+            for raw_tid in secondary_ids:
+                try:
+                    tid = int(raw_tid)
+                except Exception:
+                    continue
+                if tid < 0:
+                    continue
+                if tid not in seen_ids:
+                    seen_ids.add(tid)
+                    secondary_ids_ordered.append(tid)
+
+                                                                                
+                                                                       
+    if not ordered_track_ids:
+        ordered_track_ids = secondary_ids_ordered
+    if not ordered_track_ids:
+        return []
+
+    track_meta: dict[int, dict[str, Any]] = {}
+    if tracks_csv_path and Path(tracks_csv_path).exists():
+        try:
+            import pandas as pd
+
+            tracks_df = pd.read_csv(tracks_csv_path)
+            if not tracks_df.empty and "track_id" in tracks_df.columns:
+                for tid in ordered_track_ids:
+                    rows = tracks_df[tracks_df["track_id"] == tid]
+                    if rows.empty:
+                        continue
+                    class_name = "unknown"
+                    if "class_name" in rows.columns:
+                        mode = rows["class_name"].astype(str).mode()
+                        if not mode.empty:
+                            class_name = str(mode.iloc[0]).strip().lower() or "unknown"
+                    max_conf = 0.0
+                    if "conf" in rows.columns:
+                        try:
+                            max_conf = float(rows["conf"].astype(float).max())
+                        except Exception:
+                            max_conf = 0.0
+                    track_meta[tid] = {
+                        "class_name": class_name,
+                        "boxes": int(len(rows.index)),
+                        "max_conf": max(0.0, min(1.0, max_conf)),
+                    }
+        except Exception:
+            track_meta = {}
+
+    actors: list[dict[str, Any]] = []
+
+    for idx, tid in enumerate(ordered_track_ids, start=1):
+        meta = track_meta.get(tid, {})
+        class_name = str(meta.get("class_name", "unknown")).strip().lower() or "unknown"
+        role = assign_actor_roles_from_tracks(class_name)
+        if role not in {"car", "bus", "truck", "motorcycle", "bicycle", "pedestrian", "unknown"}:
+            role = "unknown"
+        boxes = int(meta.get("boxes", 0))
+        max_conf = float(meta.get("max_conf", 0.0))
+        is_direct = tid in direct_ids
+        if boxes > 0:
+            prefix = "Directly involved" if is_direct else "Secondary involved"
+            description = (
+                f"{prefix} {class_name} participant "
+                f"(track_id={tid}, boxes={boxes}, max_conf={max_conf:.2f})."
+            )
+        else:
+            prefix = "Directly involved" if is_direct else "Secondary involved"
+            description = f"{prefix} participant (track_id={tid})."
+        actors.append(
+            {
+                "actor_id": f"a{idx}",
+                "role": role,
+                "description": description,
+                "track_id": tid,
+            }
+        )
+
+    return actors
+
+
+def extract_summary(report_json: dict[str, Any]) -> dict[str, Any]:
+
+    if not isinstance(report_json, dict):
+        raise ValueError("Report payload must be a JSON object")
+
+    overall = report_json.get("overall_assessment", {})
+    segments = report_json.get("segments", [])
+
+    claims_count = 0
+    if isinstance(segments, list):
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            claims = segment.get("claims", [])
+            if isinstance(claims, list):
+                claims_count += len(claims)
+
+    uncertainty_flags = []
+    if isinstance(overall, dict):
+        raw_flags = overall.get("uncertainty_flags", [])
+        if isinstance(raw_flags, list):
+            uncertainty_flags = [str(flag) for flag in raw_flags]
+
+    return {
+        "event_type": str(overall.get("event_type", "unknown")),
+        "severity": str(overall.get("severity", "unknown")),
+        "review_required": bool(overall.get("review_required", False)),
+        "claims_count": int(claims_count),
+        "uncertainty_flags": uncertainty_flags,
+    }
+
+
+def save_reviewed_copy(
+    report_path: str | Path,
+    override_event_type: str,
+    override_severity: str,
+    reviewer_note: str,
+) -> str:
+
+    original_path = Path(report_path)
+    if not original_path.exists() or not original_path.is_file():
+        raise FileNotFoundError(f"Report JSON not found: {original_path}")
+
+    payload = load_json(original_path)
+    if not isinstance(payload, dict):
+        raise ValueError("Report JSON must be an object")
+
+    overall = payload.get("overall_assessment")
+    if not isinstance(overall, dict):
+        raise ValueError("Report missing overall_assessment object")
+
+    if override_event_type != "keep":
+        overall["event_type"] = override_event_type
+
+    if override_severity != "keep":
+        overall["severity"] = override_severity
+
+    audit = payload.get("audit")
+    if not isinstance(audit, dict):
+        raise ValueError("Report missing audit object")
+
+    existing_notes = str(audit.get("notes", "")).strip()
+    clean_note = reviewer_note.strip()
+    if clean_note:
+        note_suffix = f"reviewer_note={clean_note}"
+        audit["notes"] = f"{existing_notes};{note_suffix}" if existing_notes else note_suffix
+
+    validated = IncidentReport.model_validate_json(json.dumps(payload))
+
+    reviewed_dir = REVIEWED_DIR
+    reviewed_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = reviewed_dir / f"{original_path.stem}_reviewed_{timestamp}.json"
+
+    counter = 1
+    while out_path.exists():
+        out_path = reviewed_dir / f"{original_path.stem}_reviewed_{timestamp}_{counter}.json"
+        counter += 1
+
+    out_path.write_text(validated.model_dump_json(indent=2), encoding="utf-8")
+    return str(out_path)
+
+
+def apply_grounded_claims_to_report(
+    report_json_path: str | Path,
+    involvement_json_path: str | Path,
+) -> dict[str, Any]:
+
+    report_path = Path(report_json_path)
+    involvement_path = Path(involvement_json_path)
+    if not report_path.exists() or not report_path.is_file():
+        raise FileNotFoundError(f"Report JSON not found: {report_path}")
+    if not involvement_path.exists() or not involvement_path.is_file():
+        raise FileNotFoundError(f"Involvement JSON not found: {involvement_path}")
+
+    report_payload = load_json(report_path)
+    involvement_payload = load_json(involvement_path)
+    if not isinstance(report_payload, dict):
+        raise ValueError("Report JSON must be an object")
+    if not isinstance(involvement_payload, dict):
+        raise ValueError("Involvement JSON must be an object")
+
+    report_segments = report_payload.get("segments", [])
+    report_segment = (
+        report_segments[0]
+        if isinstance(report_segments, list) and report_segments and isinstance(report_segments[0], dict)
+        else None
+    )
+    if report_segment is None:
+        raise ValueError("Report JSON missing first segment object")
+
+    report_segment_id = str(report_segment.get("segment_id", "")).strip()
+    inv_segment_id = str(involvement_payload.get("segment_id", "")).strip()
+    if report_segment_id and inv_segment_id and report_segment_id != inv_segment_id:
+        return {"updated_claims": 0, "segment_mismatch": True}
+
+    claim_rows_raw = involvement_payload.get("claims", [])
+    claim_rows: list[dict[str, Any]] = []
+    if isinstance(claim_rows_raw, list):
+        scored_by_sig: dict[tuple[Any, ...], tuple[int, float, dict[str, Any]]] = {}
+        sig_order: list[tuple[Any, ...]] = []
+
+        def _row_pair_key(row: dict[str, Any]) -> tuple[int, ...]:
+            ids = row.get("primary_track_ids", [])
+            if not isinstance(ids, list):
+                return ()
+            out: list[int] = []
+            for raw in ids:
+                try:
+                    out.append(int(raw))
+                except Exception:
+                    continue
+            if len(out) >= 2:
+                return tuple(sorted(out[:2]))
+            return tuple(out)
+
+        def _row_peak_bucket(row: dict[str, Any], pair_key: tuple[int, ...]) -> float | None:
+            if len(pair_key) < 2:
+                return None
+            candidates = row.get("impact_pair_candidates", [])
+            if not isinstance(candidates, list):
+                return None
+            best_score = -1e9
+            best_ts: float | None = None
+            for item in candidates:
+                if not isinstance(item, dict):
+                    continue
+                pair = item.get("pair", [])
+                if not isinstance(pair, list) or len(pair) != 2:
+                    continue
+                try:
+                    key = tuple(sorted([int(pair[0]), int(pair[1])]))
+                except Exception:
+                    continue
+                if key != pair_key:
+                    continue
+                try:
+                    score = float(item.get("selection_score", item.get("peak_score", 0.0)))
+                except Exception:
+                    score = 0.0
+                ts_raw = item.get("peak_timestamp_sec")
+                ts_val = float(ts_raw) if isinstance(ts_raw, (int, float)) else None
+                if score > best_score:
+                    best_score = score
+                    best_ts = ts_val
+            if best_ts is None:
+                return None
+            return round(float(best_ts) * 2.0) / 2.0
+
+        def _row_signature(row: dict[str, Any]) -> tuple[Any, ...]:
+            event = str(row.get("event_type", "none")).strip().lower() or "none"
+            pair_key = _row_pair_key(row)
+            if pair_key:
+                return ("pair", event, pair_key, _row_peak_bucket(row, pair_key))
+            grounded = " ".join(str(row.get("grounded_statement", "")).strip().lower().split())
+            return ("text", event, grounded)
+
+        def _row_rank(row: dict[str, Any]) -> tuple[int, float]:
+            method = str(row.get("method", "")).strip().lower()
+            method_rank = {"ai": 3, "heuristic_fallback": 2, "derived_secondary": 1}.get(method, 0)
+            conf_raw = row.get("decision_confidence", row.get("derived_support_confidence", 0.0))
+            try:
+                conf = float(conf_raw)
+            except Exception:
+                conf = 0.0
+            return (method_rank, conf)
+
+        for row in claim_rows_raw:
+            if not isinstance(row, dict):
+                continue
+            claim_id = str(row.get("claim_id", "")).strip()
+            grounded = " ".join(str(row.get("grounded_statement", "")).strip().split())
+            if not claim_id or not grounded:
+                continue
+            sig = _row_signature(row)
+            rank = _row_rank(row)
+            existing = scored_by_sig.get(sig)
+            if existing is None:
+                scored_by_sig[sig] = (rank[0], rank[1], row)
+                sig_order.append(sig)
+            else:
+                prev_rank = (existing[0], existing[1])
+                if rank > prev_rank:
+                    scored_by_sig[sig] = (rank[0], rank[1], row)
+
+        claim_rows = [scored_by_sig[sig][2] for sig in sig_order]
+        for idx, row in enumerate(claim_rows, start=1):
+            row["claim_id"] = f"clm_{idx:03d}"
+
+    grounded_by_id: dict[str, str] = {}
+    switch_by_id: dict[str, bool] = {}
+    ordered_involved_ids: list[int] = []
+    seen_involved_ids: set[int] = set()
+    fallback_secondary_ids: list[int] = []
+    for item in claim_rows:
+        if not isinstance(item, dict):
+            continue
+        claim_id = str(item.get("claim_id", "")).strip()
+        grounded = " ".join(str(item.get("grounded_statement", "")).strip().split())
+        if claim_id and grounded:
+            grounded_by_id[claim_id] = grounded
+            flags = item.get("ambiguity_flags", [])
+            if isinstance(flags, list) and "possible_id_switch" in {str(flag) for flag in flags}:
+                switch_by_id[claim_id] = True
+        primary_ids = item.get("primary_track_ids", [])
+        if isinstance(primary_ids, list):
+            for raw_tid in primary_ids:
+                try:
+                    tid = int(raw_tid)
+                except Exception:
+                    continue
+                if tid < 0 or tid in seen_involved_ids:
+                    continue
+                seen_involved_ids.add(tid)
+                ordered_involved_ids.append(tid)
+        secondary_ids = item.get("secondary_track_ids", [])
+        if isinstance(secondary_ids, list):
+            for raw_tid in secondary_ids:
+                try:
+                    tid = int(raw_tid)
+                except Exception:
+                    continue
+                if tid < 0 or tid in seen_involved_ids:
+                    continue
+                seen_involved_ids.add(tid)
+                fallback_secondary_ids.append(tid)
+
+    if not ordered_involved_ids:
+        ordered_involved_ids = fallback_secondary_ids
+
+    claims = report_segment.get("claims", [])
+    if not isinstance(claims, list):
+        raise ValueError("Report segment claims must be a list")
+    existing_by_id: dict[str, dict[str, Any]] = {}
+    for claim in claims:
+        if not isinstance(claim, dict):
+            continue
+        claim_id = str(claim.get("claim_id", "")).strip()
+        if claim_id:
+            existing_by_id[claim_id] = claim
+
+    updated = 0
+    base_claim_template = claims[0] if claims and isinstance(claims[0], dict) else None
+    rebuilt_claims: list[dict[str, Any]] = []
+    if claim_rows and isinstance(base_claim_template, dict):
+        for item in claim_rows:
+            if not isinstance(item, dict):
+                continue
+            claim_id = str(item.get("claim_id", "")).strip()
+            if not claim_id:
+                continue
+            grounded = grounded_by_id.get(claim_id, "")
+            if not grounded:
+                continue
+            source_claim = existing_by_id.get(claim_id, base_claim_template)
+            event_type = str(item.get("event_type", source_claim.get("event_type", "none"))).strip() or "none"
+            severity = str(source_claim.get("severity", base_claim_template.get("severity", "unknown"))).strip() or "unknown"
+            evidence_frames = source_claim.get("evidence_frames", base_claim_template.get("evidence_frames", []))
+            if not isinstance(evidence_frames, list) or not evidence_frames:
+                fallback_frames = base_claim_template.get("evidence_frames", [])
+                evidence_frames = fallback_frames if isinstance(fallback_frames, list) and fallback_frames else [0]
+
+            support_raw = item.get(
+                "derived_support_confidence",
+                item.get("decision_confidence", source_claim.get("support_confidence", 0.0)),
+            )
+            try:
+                support = float(support_raw)
+            except Exception:
+                support = float(source_claim.get("support_confidence", 0.7))
+            support = max(0.0, min(1.0, support))
+            if support <= 0.0:
+                support = max(0.0, min(1.0, float(source_claim.get("support_confidence", 0.7))))
+
+            raw_existing_flags = source_claim.get("uncertainty_flags", [])
+            uncertainty_flags = [str(flag) for flag in raw_existing_flags] if isinstance(raw_existing_flags, list) else []
+            raw_new_flags = item.get("ambiguity_flags", [])
+            if isinstance(raw_new_flags, list):
+                for flag in raw_new_flags:
+                    text = str(flag).strip()
+                    if text and text not in uncertainty_flags:
+                        uncertainty_flags.append(text)
+            if switch_by_id.get(claim_id) and "possible_id_switch" not in uncertainty_flags:
+                uncertainty_flags.append("possible_id_switch")
+
+            rebuilt_claims.append(
+                {
+                    "claim_id": claim_id,
+                    "event_type": event_type,
+                    "severity": severity,
+                    "statement": grounded,
+                    "support_confidence": support,
+                    "evidence_frames": evidence_frames,
+                    "uncertainty_flags": uncertainty_flags,
+                }
+            )
+        if rebuilt_claims:
+            claims[:] = rebuilt_claims
+            updated = len(rebuilt_claims)
+    else:
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            claim_id = str(claim.get("claim_id", "")).strip()
+            grounded = grounded_by_id.get(claim_id, "")
+            if not grounded:
+                continue
+            claim["statement"] = grounded
+            if switch_by_id.get(claim_id):
+                flags = claim.get("uncertainty_flags", [])
+                if not isinstance(flags, list):
+                    flags = []
+                if "possible_id_switch" not in {str(flag) for flag in flags}:
+                    flags.append("possible_id_switch")
+                claim["uncertainty_flags"] = flags
+            updated += 1
+
+    def _claim_sort_key(item: dict[str, Any]) -> tuple[int, str]:
+        claim_id = str(item.get("claim_id", "")).strip()
+        match = re.match(r"^clm_(\d+)$", claim_id)
+        if match is not None:
+            try:
+                return (int(match.group(1)), claim_id)
+            except Exception:
+                return (999999, claim_id)
+        return (999999, claim_id)
+
+    claims.sort(key=_claim_sort_key)
+
+                                                                        
+    if ordered_involved_ids:
+        track_meta: dict[int, dict[str, Any]] = {}
+        tracks_csv_value = involvement_payload.get("tracks_csv")
+        tracks_csv_candidate = Path(str(tracks_csv_value)) if isinstance(tracks_csv_value, str) else None
+        if tracks_csv_candidate and not tracks_csv_candidate.is_absolute():
+            tracks_csv_candidate = (Path.cwd() / tracks_csv_candidate).resolve(strict=False)
+        if tracks_csv_candidate and tracks_csv_candidate.exists():
+            try:
+                import pandas as pd
+
+                tracks_df = pd.read_csv(tracks_csv_candidate)
+                if not tracks_df.empty and "track_id" in tracks_df.columns:
+                    for tid in ordered_involved_ids:
+                        rows = tracks_df[tracks_df["track_id"] == tid]
+                        if rows.empty:
+                            continue
+                        class_name = "unknown"
+                        if "class_name" in rows.columns:
+                            mode = rows["class_name"].astype(str).mode()
+                            if not mode.empty:
+                                class_name = str(mode.iloc[0]).strip().lower() or "unknown"
+                        max_conf = 0.0
+                        if "conf" in rows.columns:
+                            try:
+                                max_conf = float(rows["conf"].astype(float).max())
+                            except Exception:
+                                max_conf = 0.0
+                        track_meta[tid] = {
+                            "class_name": class_name,
+                            "max_conf": max(0.0, min(1.0, max_conf)),
+                        }
+            except Exception:
+                track_meta = {}
+
+        actors: list[dict[str, Any]] = []
+        direct_set: set[int] = set()
+        if isinstance(claim_rows, list):
+            for item in claim_rows:
+                if not isinstance(item, dict):
+                    continue
+                ids = item.get("primary_track_ids", [])
+                if not isinstance(ids, list):
+                    continue
+                for raw_tid in ids:
+                    try:
+                        direct_set.add(int(raw_tid))
+                    except Exception:
+                        continue
+
+        for idx, tid in enumerate(ordered_involved_ids, start=1):
+            meta = track_meta.get(tid, {})
+            class_name = str(meta.get("class_name", "unknown")).strip().lower() or "unknown"
+            role = assign_actor_roles_from_tracks(class_name)
+            if role not in {"car", "bus", "truck", "motorcycle", "bicycle", "pedestrian", "unknown"}:
+                role = "unknown"
+            max_conf = float(meta.get("max_conf", 0.0))
+            prefix = "Directly involved" if tid in direct_set else "Secondary involved"
+            if class_name and class_name != "unknown":
+                description = f"{prefix} {class_name} participant (track_id={tid}, max_conf={max_conf:.2f})."
+            else:
+                description = f"{prefix} participant (track_id={tid})."
+            actors.append(
+                {
+                    "actor_id": f"a{idx}",
+                    "role": role,
+                    "description": description,
+                }
+            )
+        report_payload["actors"] = actors
+
+    audit = report_payload.get("audit", {})
+    if isinstance(audit, dict):
+        notes = str(audit.get("notes", "")).strip()
+        marker = "statement_grounding=involvement_v1"
+        if marker not in notes:
+            audit["notes"] = f"{notes};{marker}" if notes else marker
+
+    validated = IncidentReport.model_validate_json(json.dumps(report_payload))
+    report_path.write_text(validated.model_dump_json(indent=2), encoding="utf-8")
+    return {"updated_claims": int(updated), "segment_mismatch": False}
+
+
+def frame_to_seconds(frame_idx: int, fps: float | None, fallback_fps: float = 2.0) -> float:
+
+    fps_value = float(fps) if fps is not None else float(fallback_fps)
+    if fps_value <= 0:
+        fps_value = float(fallback_fps)
+    if fps_value <= 0:
+        fps_value = 2.0
+    return float(frame_idx) / fps_value
+
+
+def resolve_keyframe_metadata(
+    keyframe_path: str,
+    frames_json_path: str | None,
+    video_path: str | None,
+    fallback_fps: float = 2.0,
+) -> dict[str, Any]:
+
+    sampled_idx = _frame_idx_from_path(keyframe_path)
+    source_idx: int | None = None
+    timestamp_sec: float | None = None
+    mapping_quality = "fallback"
+    fps_hint: float | None = None
+
+    frame_row: dict[str, Any] | None = None
+    if frames_json_path and Path(frames_json_path).exists():
+        try:
+            cache = _frames_index_cache(str(Path(frames_json_path).resolve(strict=False)))
+            fps_hint = cache.get("probe_fps")
+            by_path = cache.get("by_path", {})
+            by_sample_idx = cache.get("by_sample_idx", {})
+            frame_row = by_path.get(_normalize_compare_path(keyframe_path))
+            if frame_row is None and sampled_idx is not None:
+                frame_row = by_sample_idx.get(int(sampled_idx))
+        except Exception:
+            frame_row = None
+
+    if frame_row is not None:
+        frame_id = frame_row.get("frame_id")
+        orig_idx = frame_row.get("orig_frame_idx")
+        t_sec = frame_row.get("time_sec")
+        sampled_idx = int(frame_id) if isinstance(frame_id, int) else sampled_idx
+        source_idx = int(orig_idx) if isinstance(orig_idx, int) else None
+        timestamp_sec = float(t_sec) if isinstance(t_sec, (int, float)) else None
+        if timestamp_sec is None and source_idx is not None:
+            timestamp_sec = frame_to_seconds(source_idx, fps_hint, fallback_fps=fallback_fps)
+        mapping_quality = "exact"
+        return {
+            "sampled_frame_idx": sampled_idx,
+            "source_frame_idx": source_idx,
+            "timestamp_sec": timestamp_sec,
+            "mapping_quality": mapping_quality,
+        }
+
+    video_fps: float | None = None
+    if video_path and Path(video_path).exists():
+        try:
+            probe = probe_video(video_path)
+            fps_val = probe.get("fps")
+            if isinstance(fps_val, (int, float)):
+                video_fps = float(fps_val)
+        except Exception:
+            video_fps = None
+
+    if sampled_idx is not None:
+        best_fps = fps_hint if fps_hint and fps_hint > 0 else video_fps
+        timestamp_sec = frame_to_seconds(sampled_idx, best_fps, fallback_fps=fallback_fps)
+        mapping_quality = "estimated" if best_fps and best_fps > 0 else "fallback"
+
+    return {
+        "sampled_frame_idx": sampled_idx,
+        "source_frame_idx": source_idx,
+        "timestamp_sec": timestamp_sec,
+        "mapping_quality": mapping_quality,
+    }
+
+
+def render_annotated_keyframe(
+    image_path: str,
+    output_path: str | None,
+    overlay_lines: list[str],
+) -> str:
+
+    import cv2
+
+    _ = output_path
+    ensure_dirs()
+
+    src = Path(image_path)
+    if not src.exists() or not src.is_file():
+        raise FileNotFoundError(f"Keyframe image not found: {src}")
+
+    concise_lines = [str(line).strip() for line in overlay_lines if str(line).strip()][:4]
+    stat = src.stat()
+    signature_input = (
+        f"{src.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{'|'.join(concise_lines)}"
+    )
+    signature = sha1(signature_input.encode("utf-8")).hexdigest()[:16]
+    out_path = RENDERED_FRAMES_DIR / f"{src.stem}_{signature}.jpg"
+    if out_path.exists():
+        return str(out_path)
+
+    image = cv2.imread(str(src), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Unable to read keyframe image: {src}")
+
+    line_height = 28
+    padding = 10
+    block_height = padding * 2 + max(1, len(concise_lines)) * line_height
+    block_width = min(image.shape[1], int(image.shape[1] * 0.9))
+
+    overlay = image.copy()
+    cv2.rectangle(overlay, (0, 0), (block_width, block_height), (0, 0, 0), thickness=-1)
+    image = cv2.addWeighted(overlay, 0.5, image, 0.5, 0)
+
+    y = padding + 20
+    for line in concise_lines:
+        cv2.putText(
+            image,
+            line,
+            (padding, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.62,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        y += line_height
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ok = cv2.imwrite(str(out_path), image)
+    if not ok:
+        raise ValueError(f"Failed to write rendered keyframe: {out_path}")
+    return str(out_path)
+
+
+def map_claim_to_keyframes(claim: dict[str, Any] | None, keyframe_paths: list[str]) -> list[str]:
+
+    if not claim:
+        return keyframe_paths[:]
+
+    evidence = claim.get("evidence_frames", [])
+    if not isinstance(evidence, list) or not evidence:
+        return []
+
+    evidence_ids = {int(item) for item in evidence if isinstance(item, int)}
+    matched: list[str] = []
+    for path in keyframe_paths:
+        frame_idx = _frame_idx_from_path(path)
+        if frame_idx is not None and frame_idx in evidence_ids:
+            matched.append(path)
+    return matched
+
+
+def _best_pair_single_frame_with_score(rows: list[dict[str, Any]]) -> tuple[list[int], float]:
+
+    import math
+    from itertools import combinations
+
+    if len(rows) < 2:
+        return ([], 0.0)
+
+    def _center(row: dict[str, Any]) -> tuple[float, float]:
+        return ((float(row["x1"]) + float(row["x2"])) / 2.0, (float(row["y1"]) + float(row["y2"])) / 2.0)
+
+    def _area(row: dict[str, Any]) -> float:
+        w = max(0.0, float(row["x2"]) - float(row["x1"]))
+        h = max(0.0, float(row["y2"]) - float(row["y1"]))
+        return w * h
+
+    def _iou(left: dict[str, Any], right: dict[str, Any]) -> float:
+        ix1 = max(float(left["x1"]), float(right["x1"]))
+        iy1 = max(float(left["y1"]), float(right["y1"]))
+        ix2 = min(float(left["x2"]), float(right["x2"]))
+        iy2 = min(float(left["y2"]), float(right["y2"]))
+        iw = max(0.0, ix2 - ix1)
+        ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        union = _area(left) + _area(right) - inter
+        return 0.0 if union <= 0.0 else inter / union
+
+    best_per_track: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        tid = int(row.get("track_id", -1))
+        if tid < 0:
+            continue
+        prev = best_per_track.get(tid)
+        if prev is None or float(row.get("conf", 0.0)) > float(prev.get("conf", 0.0)):
+            best_per_track[tid] = row
+
+    uniq_rows = list(best_per_track.values())
+    if len(uniq_rows) < 2:
+        return ([], 0.0)
+
+    best_score = -1.0
+    best_pair: list[int] = []
+    for left, right in combinations(uniq_rows, 2):
+        cx1, cy1 = _center(left)
+        cx2, cy2 = _center(right)
+        dist = math.hypot(cx1 - cx2, cy1 - cy2)
+        diag = max(1.0, math.sqrt(max(1.0, (_area(left) + _area(right)) / 2.0)))
+        proximity = max(0.0, 1.0 - min(dist / diag, 3.0) / 3.0)
+        overlap = _iou(left, right)
+        conf_mean = (float(left.get("conf", 0.0)) + float(right.get("conf", 0.0))) / 2.0
+        score = (0.7 * proximity + 0.3 * overlap) * max(0.0, min(1.0, conf_mean))
+        if score > best_score:
+            best_score = score
+            best_pair = sorted([int(left["track_id"]), int(right["track_id"])])
+
+    return (best_pair, max(0.0, float(best_score)))
+
+
+def render_keyframe_with_tracks(
+    keyframe_image_path: str,
+    keyframe_timestamp_sec: float | None,
+    tracks_csv_path: str | None,
+    out_path: str,
+    time_tolerance_sec: float = 0.12,
+    video_path: str | None = None,
+) -> dict[str, Any]:
+
+    import cv2
+    import pandas as pd
+
+    src = Path(keyframe_image_path)
+    dst = Path(out_path)
+    if not src.exists() or not src.is_file():
+        raise FileNotFoundError(f"Keyframe image not found: {src}")
+
+    image = cv2.imread(str(src), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Unable to read keyframe image: {src}")
+
+    boxes_drawn = 0
+    matched_rows = 0
+    matched_timestamp_sec: float | None = None
+
+    rows_df = None
+    tracks_df = None
+    if tracks_csv_path and Path(tracks_csv_path).exists() and keyframe_timestamp_sec is not None:
+        try:
+            tracks_df = pd.read_csv(tracks_csv_path)
+            if not tracks_df.empty and "timestamp_sec" in tracks_df.columns:
+                tracks_df["delta"] = (tracks_df["timestamp_sec"] - float(keyframe_timestamp_sec)).abs()
+                within = tracks_df[tracks_df["delta"] <= float(time_tolerance_sec)]
+                if not within.empty:
+                    closest_idx = within["delta"].idxmin()
+                    matched_timestamp_sec = float(within.loc[closest_idx, "timestamp_sec"])
+                    rows_df = within[(within["timestamp_sec"] - matched_timestamp_sec).abs() < 1e-9]
+        except Exception:
+            rows_df = None
+            tracks_df = None
+
+    def _resolve_source_dimensions() -> tuple[int, int]:
+        img_h, img_w = image.shape[:2]
+        source_w = img_w
+        source_h = img_h
+
+        def _valid_dims(width_val: Any, height_val: Any) -> tuple[int, int] | None:
+            try:
+                w = int(float(width_val))
+                h = int(float(height_val))
+                if w > 0 and h > 0:
+                    return (w, h)
+            except Exception:
+                return None
+            return None
+
+        def _dims_from_df(df: Any) -> tuple[int, int] | None:
+            if df is None:
+                return None
+            columns = getattr(df, "columns", [])
+            if "frame_width" in columns and "frame_height" in columns:
+                filtered = df[["frame_width", "frame_height"]].dropna()
+                if not filtered.empty:
+                    row = filtered.iloc[0]
+                    dims = _valid_dims(row["frame_width"], row["frame_height"])
+                    if dims is not None:
+                        return dims
+            return None
+
+        dims = _dims_from_df(rows_df)
+        if dims is None:
+            dims = _dims_from_df(tracks_df)
+
+        if dims is None and tracks_csv_path:
+            csv_path = Path(tracks_csv_path)
+            summary_stem = csv_path.stem
+            if summary_stem.endswith("_tracks"):
+                summary_stem = summary_stem[: -len("_tracks")]
+            summary_path = csv_path.with_name(f"{summary_stem}_tracks_summary.json")
+            if summary_path.exists():
+                try:
+                    summary_payload = load_json(summary_path)
+                except Exception:
+                    summary_payload = {}
+                if isinstance(summary_payload, dict):
+                    dims = _valid_dims(
+                        summary_payload.get("frame_width"),
+                        summary_payload.get("frame_height"),
+                    )
+                    if dims is None:
+                        dims = _valid_dims(summary_payload.get("width"), summary_payload.get("height"))
+
+        if dims is None and video_path and Path(video_path).exists():
+            try:
+                probe = probe_video(video_path)
+                dims = _valid_dims(probe.get("width"), probe.get("height"))
+            except Exception:
+                dims = None
+
+        if dims is not None:
+            source_w, source_h = dims
+
+        return (source_w, source_h)
+
+    if rows_df is not None and not rows_df.empty:
+        matched_rows = int(len(rows_df.index))
+        src_w, src_h = _resolve_source_dimensions()
+        img_h, img_w = image.shape[:2]
+        scale_x = (float(img_w) / float(src_w)) if src_w > 0 else 1.0
+        scale_y = (float(img_h) / float(src_h)) if src_h > 0 else 1.0
+
+        for row in rows_df.itertuples(index=False):
+            x1_raw = float(getattr(row, "x1", 0.0))
+            y1_raw = float(getattr(row, "y1", 0.0))
+            x2_raw = float(getattr(row, "x2", 0.0))
+            y2_raw = float(getattr(row, "y2", 0.0))
+            x1 = int(max(0.0, min(float(img_w - 1), x1_raw * scale_x)))
+            y1 = int(max(0.0, min(float(img_h - 1), y1_raw * scale_y)))
+            x2 = int(max(0.0, min(float(img_w - 1), x2_raw * scale_x)))
+            y2 = int(max(0.0, min(float(img_h - 1), y2_raw * scale_y)))
+            class_name = str(getattr(row, "class_name", "unknown"))
+            track_id = int(getattr(row, "track_id", -1))
+            conf = float(getattr(row, "conf", 0.0))
+
+            cv2.rectangle(image, (x1, y1), (x2, y2), (0, 214, 255), 2)
+            label = f"{class_name}#{track_id} {conf:.2f}"
+            cv2.putText(
+                image,
+                label,
+                (x1, max(0, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 214, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            boxes_drawn += 1
+    else:
+        note = "No track boxes matched at this timestamp."
+        cv2.putText(
+            image,
+            note,
+            (12, max(20, image.shape[0] - 16)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (220, 220, 220),
+            2,
+            cv2.LINE_AA,
+        )
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    ok = cv2.imwrite(str(dst), image)
+    if not ok:
+        raise ValueError(f"Failed to write rendered keyframe image: {dst}")
+
+    return {
+        "boxes_drawn": int(boxes_drawn),
+        "matched_timestamp_sec": matched_timestamp_sec,
+        "matched_rows": int(matched_rows),
+        "source_frame_width": int(src_w) if rows_df is not None and not rows_df.empty else None,
+        "source_frame_height": int(src_h) if rows_df is not None and not rows_df.empty else None,
+    }
+
+
+def resolve_tracks_csv_for_report(report_json_path: str, source_video_path: str | None) -> str | None:
+
+    report_path = Path(report_json_path)
+    report_dir = report_path.parent
+    video_stem = Path(source_video_path).stem if source_video_path else ""
+
+    candidates: list[Path] = []
+
+    if report_path.exists():
+        try:
+            payload = load_json(report_path)
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            audit = payload.get("audit", {})
+            if isinstance(audit, dict):
+                notes = str(audit.get("notes", ""))
+                raw_track_source = _extract_track_source_from_notes(notes)
+                if raw_track_source:
+                    raw_path = Path(raw_track_source)
+                    candidates.append(raw_path)
+                    if not raw_path.is_absolute():
+                        candidates.append(report_dir / raw_path)
+                        candidates.append(Path.cwd() / raw_path)
+
+    if video_stem:
+        candidates.append(report_dir / f"{video_stem}_tracks.csv")
+        candidates.append((report_dir.parent if report_dir.parent else report_dir) / f"{video_stem}_tracks.csv")
+        candidates.append(Path("data") / "outputs" / f"{video_stem}_tracks.csv")
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        norm = _normalize_compare_path(candidate)
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if Path(candidate).exists() and Path(candidate).is_file():
+            return str(Path(candidate))
+    return None
+
+
+def list_report_files(outputs_dir: str | Path, video_stem: str, show_deprecated: bool = False) -> list[str]:
+
+    report_dir = Path(outputs_dir) / "reports"
+    if not report_dir.exists():
+        return []
+
+    files = sorted(report_dir.glob(f"{video_stem}_*_report.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+    def canonical_key(path: Path) -> str:
+        stem = path.stem
+        if stem.endswith("_report"):
+            stem = stem[: -len("_report")]
+        parts = stem.split("_")
+        compact: list[str] = []
+        for token in parts:
+            if compact and compact[-1].lower() == token.lower():
+                continue
+            compact.append(token)
+        compact_stem = "_".join(compact)
+        compact_stem = DEPRECATED_REPEAT_PATTERN.sub(lambda m: f"_{m.group(1)}_", f"_{compact_stem}_").strip("_")
+        return compact_stem.lower()
+
+    selected: dict[str, Path] = {}
+    for path in files:
+        deprecated = bool(DEPRECATED_REPEAT_PATTERN.search(path.name.lower()))
+        if deprecated and not show_deprecated:
+            continue
+        key = canonical_key(path)
+        if key not in selected:
+            selected[key] = path
+
+    return [str(path) for path in selected.values()]
+
+
+def evaluate_claim_visual_support(
+    claim: dict[str, Any],
+    keyframe_paths: list[str],
+    frames_json_path: str | None,
+    video_path: str | None,
+    tracks_csv_path: str | None,
+) -> dict[str, Any]:
+
+    if not isinstance(claim, dict):
+        return {
+            "has_visual_boxes_any_evidence_frame": False,
+            "strongest_evidence_frame": None,
+            "visual_support_level": "weak",
+            "strongest_boxes": 0,
+        }
+
+    evidence_keyframes = map_claim_to_keyframes(claim, keyframe_paths)
+    if not evidence_keyframes:
+        return {
+            "has_visual_boxes_any_evidence_frame": False,
+            "strongest_evidence_frame": None,
+            "visual_support_level": "weak",
+            "strongest_boxes": 0,
+        }
+
+    best_path: str | None = None
+    best_boxes = 0
+    best_pair_score = 0.0
+    best_pair: list[int] = []
+    for keyframe in evidence_keyframes:
+        meta = resolve_keyframe_metadata(
+            keyframe_path=keyframe,
+            frames_json_path=frames_json_path,
+            video_path=video_path,
+            fallback_fps=2.0,
+        )
+        timestamp = meta.get("timestamp_sec")
+        if timestamp is None or not tracks_csv_path:
+            continue
+
+        rows_payload = tracks_at_timestamp(
+            tracks_csv_path=tracks_csv_path,
+            timestamp_sec=float(timestamp),
+            time_tolerance_sec=0.12,
+        )
+        rows = rows_payload.get("rows", []) if isinstance(rows_payload, dict) else []
+        if not isinstance(rows, list) or not rows:
+            continue
+        boxes = len(rows)
+        pair, pair_score = _best_pair_single_frame_with_score(rows)
+        if (
+            pair_score > best_pair_score
+            or (abs(pair_score - best_pair_score) < 1e-9 and boxes > best_boxes)
+        ):
+            best_pair_score = float(pair_score)
+            best_boxes = int(boxes)
+            best_path = keyframe
+            best_pair = pair
+
+    if best_pair_score >= 0.35 or best_boxes >= 3:
+        level = "strong"
+    elif best_pair_score >= 0.2 or best_boxes >= 1:
+        level = "partial"
+    else:
+        level = "weak"
+
+    return {
+        "has_visual_boxes_any_evidence_frame": best_boxes > 0,
+        "strongest_evidence_frame": best_path,
+        "visual_support_level": level,
+        "strongest_boxes": int(best_boxes),
+        "strongest_pair_hint": best_pair,
+        "strongest_pair_score": round(float(best_pair_score), 4),
+    }
+
+
+def summarize_claim_track_evidence(
+    claim: dict[str, Any] | None,
+    keyframe_paths: list[str],
+    frames_json_path: str | None,
+    video_path: str | None,
+    tracks_csv_path: str | None,
+    time_tolerance_sec: float = 0.12,
+) -> dict[str, Any]:
+
+    import pandas as pd
+    import math
+    from itertools import combinations
+
+    if not tracks_csv_path or not Path(tracks_csv_path).exists():
+        return {
+            "has_track_evidence": False,
+            "matched_keyframes": 0,
+            "unique_track_ids": 0,
+            "class_counts": {},
+            "tracks": [],
+            "track_ids": [],
+        }
+
+    try:
+        tracks_df = pd.read_csv(tracks_csv_path)
+    except Exception:
+        return {
+            "has_track_evidence": False,
+            "matched_keyframes": 0,
+            "unique_track_ids": 0,
+            "class_counts": {},
+            "tracks": [],
+            "track_ids": [],
+        }
+
+    if tracks_df.empty or "timestamp_sec" not in tracks_df.columns:
+        return {
+            "has_track_evidence": False,
+            "matched_keyframes": 0,
+            "unique_track_ids": 0,
+            "class_counts": {},
+            "tracks": [],
+            "track_ids": [],
+        }
+
+    candidate_keyframes = map_claim_to_keyframes(claim, keyframe_paths) if claim else keyframe_paths[:]
+    if claim and not candidate_keyframes:
+        candidate_keyframes = keyframe_paths[:]
+    if not candidate_keyframes:
+        return {
+            "has_track_evidence": False,
+            "matched_keyframes": 0,
+            "unique_track_ids": 0,
+            "class_counts": {},
+            "tracks": [],
+            "track_ids": [],
+        }
+
+    ts_series = tracks_df["timestamp_sec"].astype(float)
+    matched_frame_count = 0
+    matched_rows: list[dict[str, Any]] = []
+    for keyframe in candidate_keyframes:
+        meta = resolve_keyframe_metadata(
+            keyframe_path=keyframe,
+            frames_json_path=frames_json_path,
+            video_path=video_path,
+            fallback_fps=2.0,
+        )
+        timestamp = meta.get("timestamp_sec")
+        if timestamp is None:
+            continue
+        delta = (ts_series - float(timestamp)).abs()
+        closest_idx = delta.idxmin()
+        min_delta = float(delta.loc[closest_idx])
+        if min_delta > float(time_tolerance_sec):
+            continue
+        matched_frame_count += 1
+        matched_timestamp = float(ts_series.loc[closest_idx])
+        at_timestamp = tracks_df[(ts_series - matched_timestamp).abs() < 1e-9]
+        for row in at_timestamp.itertuples(index=False):
+            track_id = int(getattr(row, "track_id", -1))
+            if track_id < 0:
+                continue
+            matched_rows.append(
+                {
+                    "track_id": track_id,
+                    "class_name": str(getattr(row, "class_name", "unknown")),
+                    "conf": float(getattr(row, "conf", 0.0)),
+                    "timestamp_sec": matched_timestamp,
+                    "x1": float(getattr(row, "x1", 0.0)),
+                    "y1": float(getattr(row, "y1", 0.0)),
+                    "x2": float(getattr(row, "x2", 0.0)),
+                    "y2": float(getattr(row, "y2", 0.0)),
+                }
+            )
+
+    if not matched_rows:
+        return {
+            "has_track_evidence": False,
+            "matched_keyframes": int(matched_frame_count),
+            "unique_track_ids": 0,
+            "class_counts": {},
+            "tracks": [],
+            "track_ids": [],
+        }
+
+    class_counts: dict[str, int] = {}
+    per_track: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in matched_rows:
+        class_name = str(row["class_name"])
+        class_counts[class_name] = class_counts.get(class_name, 0) + 1
+        key = (int(row["track_id"]), class_name)
+        existing = per_track.get(key)
+        if existing is None:
+            per_track[key] = {
+                "track_id": int(row["track_id"]),
+                "class_name": class_name,
+                "boxes": 1,
+                "max_conf": float(row["conf"]),
+                "timestamps": {round(float(row["timestamp_sec"]), 3)},
+            }
+        else:
+            existing["boxes"] = int(existing["boxes"]) + 1
+            existing["max_conf"] = max(float(existing["max_conf"]), float(row["conf"]))
+            existing["timestamps"].add(round(float(row["timestamp_sec"]), 3))
+
+    tracks = sorted(
+        (
+            {
+                "track_id": int(item["track_id"]),
+                "class_name": str(item["class_name"]),
+                "boxes": int(item["boxes"]),
+                "max_conf": round(float(item["max_conf"]), 4),
+                "matched_timestamps": sorted(float(t) for t in item["timestamps"]),
+            }
+            for item in per_track.values()
+        ),
+        key=lambda item: (int(item["boxes"]), float(item["max_conf"])),
+        reverse=True,
+    )
+    track_ids = sorted({int(item["track_id"]) for item in tracks})
+
+                                                                               
+    by_timestamp: dict[float, list[dict[str, Any]]] = {}
+    for row in matched_rows:
+        by_timestamp.setdefault(round(float(row["timestamp_sec"]), 3), []).append(row)
+
+    def _center(row: dict[str, Any]) -> tuple[float, float]:
+        return ((float(row["x1"]) + float(row["x2"])) / 2.0, (float(row["y1"]) + float(row["y2"])) / 2.0)
+
+    def _area(row: dict[str, Any]) -> float:
+        w = max(0.0, float(row["x2"]) - float(row["x1"]))
+        h = max(0.0, float(row["y2"]) - float(row["y1"]))
+        return w * h
+
+    def _iou(a: dict[str, Any], b: dict[str, Any]) -> float:
+        ix1 = max(float(a["x1"]), float(b["x1"]))
+        iy1 = max(float(a["y1"]), float(b["y1"]))
+        ix2 = min(float(a["x2"]), float(b["x2"]))
+        iy2 = min(float(a["y2"]), float(b["y2"]))
+        iw = max(0.0, ix2 - ix1)
+        ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        union = _area(a) + _area(b) - inter
+        if union <= 0.0:
+            return 0.0
+        return inter / union
+
+    pair_scores: dict[tuple[int, int], dict[str, float]] = {}
+    per_timestamp_best_pair: dict[float, tuple[list[int], float, int, float]] = {}
+    for ts_key, rows in by_timestamp.items():
+        best_per_track: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            tid = int(row["track_id"])
+            prev = best_per_track.get(tid)
+            if prev is None or float(row["conf"]) > float(prev["conf"]):
+                best_per_track[tid] = row
+        uniq_rows = list(best_per_track.values())
+        if len(uniq_rows) < 2:
+            continue
+        best_frame_pair: list[int] = []
+        best_frame_score = -1.0
+        best_frame_overlap = 0.0
+        for left, right in combinations(uniq_rows, 2):
+            tid_l = int(left["track_id"])
+            tid_r = int(right["track_id"])
+            key = (min(tid_l, tid_r), max(tid_l, tid_r))
+            cx1, cy1 = _center(left)
+            cx2, cy2 = _center(right)
+            dist = math.hypot(cx1 - cx2, cy1 - cy2)
+            diag = max(1.0, math.sqrt(max(1.0, (_area(left) + _area(right)) / 2.0)))
+            dist_norm = dist / diag
+            proximity = max(0.0, 1.0 - min(dist_norm, 3.0) / 3.0)
+            overlap = _iou(left, right)
+            conf_mean = (float(left["conf"]) + float(right["conf"])) / 2.0
+            frame_score = (0.7 * proximity + 0.3 * overlap) * max(0.0, min(1.0, conf_mean))
+            if frame_score > best_frame_score:
+                best_frame_score = frame_score
+                best_frame_pair = [int(key[0]), int(key[1])]
+                best_frame_overlap = float(overlap)
+            prev = pair_scores.get(key)
+            if prev is None:
+                pair_scores[key] = {"score": frame_score, "frames": 1.0}
+            else:
+                prev["score"] += frame_score
+                prev["frames"] += 1.0
+        if best_frame_pair:
+            per_timestamp_best_pair[float(ts_key)] = (
+                best_frame_pair,
+                max(0.0, float(best_frame_score)),
+                int(len(uniq_rows)),
+                max(0.0, float(best_frame_overlap)),
+            )
+
+    impact_pair_candidates: list[dict[str, Any]] = []
+    if per_timestamp_best_pair:
+        aggregated: dict[tuple[int, int], dict[str, Any]] = {}
+        for ts_key, (pair, score, rows_count, overlap) in per_timestamp_best_pair.items():
+            if len(pair) != 2:
+                continue
+            key = (int(pair[0]), int(pair[1]))
+            item = aggregated.get(key)
+            if item is None:
+                aggregated[key] = {
+                    "pair": [int(pair[0]), int(pair[1])],
+                    "peak_score": float(score),
+                    "peak_timestamp_sec": float(ts_key),
+                    "sum_score": float(score),
+                    "frames": 1,
+                    "rows_max": int(rows_count),
+                    "peak_overlap": float(overlap),
+                    "first_sec": float(ts_key),
+                    "last_sec": float(ts_key),
+                }
+            else:
+                item["sum_score"] = float(item["sum_score"]) + float(score)
+                item["frames"] = int(item["frames"]) + 1
+                item["rows_max"] = max(int(item["rows_max"]), int(rows_count))
+                item["peak_overlap"] = max(float(item["peak_overlap"]), float(overlap))
+                item["first_sec"] = min(float(item["first_sec"]), float(ts_key))
+                item["last_sec"] = max(float(item["last_sec"]), float(ts_key))
+                if float(score) > float(item["peak_score"]):
+                    item["peak_score"] = float(score)
+                    item["peak_timestamp_sec"] = float(ts_key)
+
+        track_stats_by_id = {
+            int(item["track_id"]): {
+                "boxes": int(item["boxes"]),
+                "max_conf": float(item["max_conf"]),
+            }
+            for item in tracks
+        }
+
+        def _selection_score(item: dict[str, Any]) -> float:
+            pair = item.get("pair", [])
+            if not isinstance(pair, list) or len(pair) != 2:
+                return -1.0
+            left = track_stats_by_id.get(int(pair[0]), {})
+            right = track_stats_by_id.get(int(pair[1]), {})
+            min_conf = min(float(left.get("max_conf", 0.0)), float(right.get("max_conf", 0.0)))
+            min_boxes = min(int(left.get("boxes", 0)), int(right.get("boxes", 0)))
+            penalty = 0.0
+            if min_conf < 0.5:
+                penalty += 0.45
+            if min_boxes < 3:
+                penalty += 0.15
+            return (
+                float(item["peak_score"])
+                + 0.5 * float(item.get("peak_overlap", 0.0))
+                + 0.05 * max(0.0, float(item["frames"]) - 1.0)
+                - penalty
+            )
+
+        impact_pair_candidates = sorted(
+            (
+                {
+                    "pair": list(item["pair"]),
+                    "peak_score": round(float(item["peak_score"]), 4),
+                    "peak_timestamp_sec": round(float(item["peak_timestamp_sec"]), 3),
+                    "peak_overlap": round(float(item["peak_overlap"]), 4),
+                    "frames": int(item["frames"]),
+                    "first_sec": round(float(item["first_sec"]), 3),
+                    "last_sec": round(float(item["last_sec"]), 3),
+                    "selection_score": round(_selection_score(item), 4),
+                }
+                for item in aggregated.values()
+            ),
+            key=lambda item: (
+                float(item.get("selection_score", 0.0)),
+                float(item["peak_score"]),
+                -float(item["first_sec"]),
+            ),
+            reverse=True,
+        )
+
+    involved_track_ids: list[int] = []
+    involved_timestamp_sec: float | None = None
+    if impact_pair_candidates:
+        top = impact_pair_candidates[0]
+        pair = top.get("pair", [])
+        if isinstance(pair, list) and len(pair) == 2:
+            involved_track_ids = [int(pair[0]), int(pair[1])]
+            involved_timestamp_sec = float(top.get("peak_timestamp_sec", 0.0))
+    elif pair_scores:
+        scored_pairs = sorted(
+            pair_scores.items(),
+            key=lambda item: (item[1]["score"], item[1]["frames"]),
+            reverse=True,
+        )
+        top_pair = scored_pairs[0][0]
+        involved_track_ids = [int(top_pair[0]), int(top_pair[1])]
+    else:
+        fallback_top = [int(item["track_id"]) for item in tracks[:2]]
+        involved_track_ids = fallback_top
+
+    return {
+        "has_track_evidence": True,
+        "matched_keyframes": int(matched_frame_count),
+        "unique_track_ids": len(track_ids),
+        "class_counts": dict(sorted(class_counts.items(), key=lambda kv: kv[1], reverse=True)),
+        "tracks": tracks,
+        "track_ids": track_ids,
+        "involved_track_ids": involved_track_ids,
+        "involved_timestamp_sec": involved_timestamp_sec,
+        "impact_pair_candidates": impact_pair_candidates[:5],
+        "context_track_count": max(0, len(track_ids) - len(involved_track_ids)),
+    }
+
+
+def tracks_at_timestamp(
+    tracks_csv_path: str | Path | None,
+    timestamp_sec: float | None,
+    time_tolerance_sec: float = 0.12,
+) -> dict[str, Any]:
+
+    import pandas as pd
+
+    if not tracks_csv_path or not Path(tracks_csv_path).exists() or timestamp_sec is None:
+        return {"matched": False, "matched_timestamp_sec": None, "rows": []}
+
+    try:
+        tracks_df = pd.read_csv(tracks_csv_path)
+    except Exception:
+        return {"matched": False, "matched_timestamp_sec": None, "rows": []}
+
+    if tracks_df.empty or "timestamp_sec" not in tracks_df.columns:
+        return {"matched": False, "matched_timestamp_sec": None, "rows": []}
+
+    ts_series = tracks_df["timestamp_sec"].astype(float)
+    delta = (ts_series - float(timestamp_sec)).abs()
+    closest_idx = delta.idxmin()
+    min_delta = float(delta.loc[closest_idx])
+    if min_delta > float(time_tolerance_sec):
+        return {"matched": False, "matched_timestamp_sec": None, "rows": []}
+
+    matched_timestamp = float(ts_series.loc[closest_idx])
+    at_timestamp = tracks_df[(ts_series - matched_timestamp).abs() < 1e-9]
+    rows: list[dict[str, Any]] = []
+    for row in at_timestamp.itertuples(index=False):
+        try:
+            track_id = int(getattr(row, "track_id", -1))
+        except Exception:
+            continue
+        if track_id < 0:
+            continue
+        rows.append(
+            {
+                "track_id": track_id,
+                "class_name": str(getattr(row, "class_name", "unknown")),
+                "conf": float(getattr(row, "conf", 0.0)),
+                "timestamp_sec": matched_timestamp,
+                "x1": float(getattr(row, "x1", 0.0)),
+                "y1": float(getattr(row, "y1", 0.0)),
+                "x2": float(getattr(row, "x2", 0.0)),
+                "y2": float(getattr(row, "y2", 0.0)),
+            }
+        )
+
+    return {
+        "matched": bool(rows),
+        "matched_timestamp_sec": matched_timestamp if rows else None,
+        "rows": rows,
+    }
+
+
+def run_detecttrack(
+    video_path: str,
+    outputs_dir: str,
+    model_name: str | None = None,
+    tracker: str = "botsort.yaml",
+    conf: float = 0.25,
+    iou: float = 0.5,
+    classes: list[str] | None = None,
+    save_annotated: bool = True,
+) -> dict[str, Any]:
+
+    ensure_dirs()
+    video = Path(video_path)
+    if not video.exists() or not video.is_file():
+        raise FileNotFoundError(f"Video file not found: {video}")
+
+    outputs = Path(outputs_dir)
+    outputs.mkdir(parents=True, exist_ok=True)
+
+    class_list = classes[:] if classes else ["person", "bicycle", "car", "motorcycle", "bus", "truck"]
+    return run_detect_track_core(
+        video_path=str(video),
+        out_dir=str(outputs),
+        model_name=model_name,
+        tracker=tracker,
+        conf=float(conf),
+        iou=float(iou),
+        classes=class_list,
+        save_annotated=bool(save_annotated),
+    )

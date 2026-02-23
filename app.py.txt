@@ -1,0 +1,903 @@
+from __future__ import annotations
+
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import streamlit as st
+
+from src import app_services as services
+
+
+FRAME_ID_PATTERN = re.compile(r"f_(\d+)\.(?:jpg|jpeg|png)$", re.IGNORECASE)
+TRACK_SOURCE_PATTERN = re.compile(r"(?:^|;)track_source=([^;]+)")
+
+
+def _init_session_state() -> None:
+    defaults: dict[str, Any] = {
+        "frames_json_path": "",
+        "segments_csv_path": "",
+        "perception_json_path": "",
+        "report_json_paths": [],
+        "resolved_video_path": "",
+        "uploaded_file_sig": "",
+        "detecttrack_result": {},
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _frame_caption(path: str) -> str:
+    name = Path(path).name
+    match = FRAME_ID_PATTERN.search(name)
+    if not match:
+        return name
+    return f"frame {int(match.group(1))} | {name}"
+
+
+def _frame_idx(path: str) -> int | None:
+    match = FRAME_ID_PATTERN.search(Path(path).name)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _extract_track_source(report_json: dict[str, Any]) -> str | None:
+    audit = report_json.get("audit", {})
+    if not isinstance(audit, dict):
+        return None
+    notes = str(audit.get("notes", ""))
+    match = TRACK_SOURCE_PATTERN.search(notes)
+    if not match:
+        return None
+    return match.group(1).strip() or None
+
+
+def _parse_audit_notes_pairs(notes: str) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for part in str(notes).split(";"):
+        piece = part.strip()
+        if not piece:
+            continue
+        if "=" in piece:
+            key, value = piece.split("=", 1)
+            rows.append({"key": key.strip(), "value": value.strip()})
+        else:
+            rows.append({"key": "note", "value": piece})
+    return rows
+
+
+def _render_video(path: str) -> None:
+
+    video_path = Path(path)
+    if not video_path.exists() or not video_path.is_file():
+        st.info("Video file not found.")
+        return
+    if video_path.stat().st_size <= 0:
+        st.warning("Video file is empty.")
+        return
+
+    try:
+        video_bytes = video_path.read_bytes()
+        suffix = video_path.suffix.lower()
+        fmt = "video/mp4" if suffix == ".mp4" else ("video/webm" if suffix == ".webm" else None)
+        if fmt:
+            st.video(video_bytes, format=fmt)
+        else:
+            st.video(video_bytes)
+    except Exception:
+        st.video(str(video_path))
+
+
+def _resolve_video_path(input_mode: str, path_input: str, uploaded_file: Any) -> str:
+    if input_mode == "Use existing local file path":
+        return services.resolve_video_input(path_input)
+
+    if uploaded_file is None:
+        raise ValueError("Please upload a video file first.")
+
+    size = getattr(uploaded_file, "size", "unknown")
+    file_sig = f"{uploaded_file.name}:{size}"
+    if st.session_state.get("uploaded_file_sig") != file_sig:
+        resolved = services.resolve_video_input(uploaded_file)
+        st.session_state["resolved_video_path"] = resolved
+        st.session_state["uploaded_file_sig"] = file_sig
+
+    resolved_path = st.session_state.get("resolved_video_path", "")
+    if not resolved_path:
+        raise ValueError("Unable to resolve uploaded file path.")
+    return str(resolved_path)
+
+
+def _derived_paths(video_path: str, outputs_dir: str) -> dict[str, str]:
+    clip_stem = Path(video_path).stem or "clip"
+    outputs = Path(outputs_dir)
+    return {
+        "frames_json": str(outputs / f"{clip_stem}_frames.json"),
+        "segments_csv": str(outputs / f"{clip_stem}_segments.csv"),
+        "perception_json": str(outputs / f"{clip_stem}_perception.json"),
+    }
+
+
+def _set_paths(frames_json: str | None = None, segments_csv: str | None = None, perception_json: str | None = None) -> None:
+    if frames_json is not None:
+        st.session_state["frames_json_path"] = frames_json
+    if segments_csv is not None:
+        st.session_state["segments_csv_path"] = segments_csv
+    if perception_json is not None:
+        st.session_state["perception_json_path"] = perception_json
+
+
+def _refresh_report_paths(video_path: str, outputs_dir: str) -> None:
+    clip_stem = Path(video_path).stem or "clip"
+    st.session_state["report_json_paths"] = services.list_report_files(outputs_dir, clip_stem, show_deprecated=False)
+
+
+st.set_page_config(page_title="Traffic Incident Reporter (Local Demo)", layout="wide")
+services.ensure_dirs()
+_init_session_state()
+
+st.markdown(
+    """
+    <style>
+    .stApp {
+      background-color: #0f1117;
+      color: #e6e8eb;
+    }
+    .tir-card {
+      background: #171a21;
+      border: 1px solid #2a2f3a;
+      border-radius: 10px;
+      padding: 0.75rem 0.9rem;
+      margin-bottom: 0.65rem;
+    }
+    .tir-muted {
+      color: #9ca3af;
+      font-size: 0.9rem;
+    }
+    .tir-kv {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 0.3rem;
+    }
+    .tir-kv td {
+      border-bottom: 1px solid #2a2f3a;
+      padding: 0.28rem 0.1rem;
+      vertical-align: top;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("Traffic Incident Reporter (Local Demo)")
+st.write("Local fixed-camera incident reporting demo with evidence-linked structured outputs and human review.")
+
+left_col, middle_col, right_col = st.columns(3)
+
+with left_col:
+    st.subheader("Inputs")
+    input_mode = st.radio(
+        "Input mode",
+        options=["Use existing local file path", "Upload video (.mp4/.avi/.mov)"],
+        index=0,
+    )
+
+    video_path_input = st.text_input(
+        "Video path",
+        value="data/raw_videos/cctv_006.mp4",
+        disabled=input_mode != "Use existing local file path",
+    )
+
+    uploaded_video = st.file_uploader(
+        "Upload video",
+        type=["mp4", "avi", "mov"],
+        disabled=input_mode != "Upload video (.mp4/.avi/.mov)",
+    )
+
+    use_manual_segments = st.checkbox("Use manual segments CSV", value=False)
+    manual_segments_csv = st.text_input(
+        "Manual segments CSV path",
+        value="data/outputs/cctv_006_segments_manual.csv",
+        disabled=not use_manual_segments,
+    )
+
+    model_name = st.text_input("Model name", value="gpt-4.1")
+    max_frames = int(st.number_input("max_frames", min_value=2, max_value=12, value=4, step=1))
+    force_rerun_perception = st.checkbox("force_rerun_perception", value=False)
+
+    st.markdown("**API Key Status**")
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        st.success("OPENAI_API_KEY detected")
+    else:
+        st.error("OPENAI_API_KEY missing")
+
+    outputs_dir = st.text_input("Output base dir", value="data/outputs")
+
+with middle_col:
+    st.subheader("Actions")
+
+    if st.button("Run Ingest + Segment", use_container_width=True):
+        try:
+            with st.spinner("Running ingest + segment..."):
+                resolved_video = _resolve_video_path(input_mode, video_path_input, uploaded_video)
+                result = services.run_ingest_segment(video_path=resolved_video, outputs_dir=outputs_dir)
+                _set_paths(frames_json=result["frames_json"], segments_csv=result["segments_csv"])
+                st.session_state["resolved_video_path"] = resolved_video
+                _refresh_report_paths(resolved_video, outputs_dir)
+            st.success(f"Ingest+Segment complete. segment_count={result['segment_count']}")
+        except Exception as exc:
+            st.error(f"Ingest+Segment failed: {exc}")
+
+    if st.button("Run Perceive", use_container_width=True):
+        try:
+            if not os.getenv("OPENAI_API_KEY", "").strip():
+                raise ValueError("OPENAI_API_KEY is missing. Set it before running perception.")
+
+            resolved_video = _resolve_video_path(input_mode, video_path_input, uploaded_video)
+            st.session_state["resolved_video_path"] = resolved_video
+            derived = _derived_paths(resolved_video, outputs_dir)
+
+            frames_json_path = st.session_state.get("frames_json_path") or derived["frames_json"]
+            if not Path(frames_json_path).exists():
+                raise FileNotFoundError("Frames JSON missing. Run 'Run Ingest + Segment' first.")
+
+            if use_manual_segments:
+                segments_csv_path = manual_segments_csv
+                if not Path(segments_csv_path).exists():
+                    raise FileNotFoundError(f"Manual segments CSV not found: {segments_csv_path}")
+            else:
+                segments_csv_path = st.session_state.get("segments_csv_path") or derived["segments_csv"]
+                if not Path(segments_csv_path).exists():
+                    st.warning("Segments CSV missing. Run ingest+segment or provide manual segments CSV.")
+                    raise FileNotFoundError(f"Segments CSV not found: {segments_csv_path}")
+
+            perception_json_path = derived["perception_json"]
+            with st.spinner("Running perceive..."):
+                result = services.run_perceive(
+                    frames_json=frames_json_path,
+                    segments_csv=segments_csv_path,
+                    out_json=perception_json_path,
+                    model=model_name,
+                    max_frames=max_frames,
+                    force=force_rerun_perception,
+                )
+                _set_paths(frames_json=frames_json_path, segments_csv=segments_csv_path, perception_json=result["perception_json"])
+            st.success(
+                f"Perceive complete. ok={result['ok']} failed={result['failed']} reused_cache={result['reused_cache']}"
+            )
+        except Exception as exc:
+            st.error(f"Perceive failed: {exc}")
+
+    if st.button("Run Assemble", use_container_width=True):
+        try:
+            resolved_video = _resolve_video_path(input_mode, video_path_input, uploaded_video)
+            st.session_state["resolved_video_path"] = resolved_video
+            derived = _derived_paths(resolved_video, outputs_dir)
+            perception_json_path = st.session_state.get("perception_json_path") or derived["perception_json"]
+            if not Path(perception_json_path).exists():
+                raise FileNotFoundError("Perception JSON missing. Run 'Run Perceive' first.")
+
+            with st.spinner("Running assemble..."):
+                result = services.run_assemble(
+                    perception_json=perception_json_path,
+                    source_video=resolved_video,
+                    out_dir=str(Path(outputs_dir) / "reports"),
+                )
+                st.session_state["report_json_paths"] = result["report_paths"]
+                _set_paths(perception_json=perception_json_path)
+            st.success(f"Assemble complete. ok={result['ok']} failed={result['failed']}")
+        except Exception as exc:
+            st.error(f"Assemble failed: {exc}")
+
+    if st.button("Run Full Pipeline", use_container_width=True):
+        try:
+            if not os.getenv("OPENAI_API_KEY", "").strip():
+                raise ValueError("OPENAI_API_KEY is missing. Set it before running full pipeline.")
+
+            resolved_video = _resolve_video_path(input_mode, video_path_input, uploaded_video)
+            st.session_state["resolved_video_path"] = resolved_video
+            manual_csv = None
+            if use_manual_segments:
+                if Path(manual_segments_csv).exists():
+                    manual_csv = manual_segments_csv
+                else:
+                    st.warning("Manual segments CSV not found; falling back to auto-generated segments.")
+
+            with st.spinner("Running full pipeline..."):
+                result = services.run_full_pipeline(
+                    video_path=resolved_video,
+                    outputs_dir=outputs_dir,
+                    model=model_name,
+                    max_frames=max_frames,
+                    force=force_rerun_perception,
+                    manual_segments_csv=manual_csv,
+                )
+                _set_paths(
+                    frames_json=result["frames_json"],
+                    segments_csv=result["segments_csv"],
+                    perception_json=result["perception_json"],
+                )
+                st.session_state["report_json_paths"] = result["report_paths"]
+
+            st.success(
+                "Full pipeline complete. "
+                f"segments={result['segment_count']} perceive_ok={result['perception_ok']} "
+                f"reports={result['assemble_ok']}"
+            )
+        except Exception as exc:
+            st.error(f"Full pipeline failed: {exc}")
+
+    if st.button("Reload Existing Outputs", use_container_width=True):
+        try:
+            resolved_video = _resolve_video_path(input_mode, video_path_input, uploaded_video)
+            st.session_state["resolved_video_path"] = resolved_video
+            derived = _derived_paths(resolved_video, outputs_dir)
+
+            _set_paths(
+                frames_json=derived["frames_json"] if Path(derived["frames_json"]).exists() else "",
+                segments_csv=derived["segments_csv"] if Path(derived["segments_csv"]).exists() else "",
+                perception_json=derived["perception_json"] if Path(derived["perception_json"]).exists() else "",
+            )
+            _refresh_report_paths(resolved_video, outputs_dir)
+            st.success("Reloaded existing output paths from disk.")
+        except Exception as exc:
+            st.error(f"Reload failed: {exc}")
+
+with right_col:
+    st.subheader("Results")
+
+    resolved_video_for_view = st.session_state.get("resolved_video_path") or video_path_input
+    segments_source_path = ""
+    if use_manual_segments and Path(manual_segments_csv).exists():
+        segments_source_path = manual_segments_csv
+    else:
+        segments_source_path = st.session_state.get("segments_csv_path", "")
+
+    st.markdown("**1) Segment Proposals**")
+    if segments_source_path and Path(segments_source_path).exists():
+        try:
+            segments_df = services.load_segments_csv(segments_source_path)
+            st.dataframe(segments_df, use_container_width=True)
+            count = len(segments_df.index)
+            if count > 0 and {"segment_id", "start_sec", "end_sec"}.issubset(segments_df.columns):
+                ranges = [
+                    f"{row.segment_id}: {float(row.start_sec):.2f}s - {float(row.end_sec):.2f}s"
+                    for row in segments_df.itertuples(index=False)
+                ]
+                st.caption(f"count={count}")
+                st.caption(" | ".join(ranges))
+            elif count == 0:
+                st.info("No segments detected. You can provide manual segments CSV.")
+            else:
+                st.caption(f"count={count}")
+        except Exception as exc:
+            st.error(f"Unable to load segments CSV: {exc}")
+    else:
+        st.info("No segments CSV loaded yet.")
+
+    st.markdown("**2) Keyframe Evidence Gallery**")
+    perception_payload: list[dict[str, Any]] = []
+    perception_json_path = st.session_state.get("perception_json_path", "")
+    if perception_json_path and Path(perception_json_path).exists():
+        loaded = services.load_json(perception_json_path)
+        if isinstance(loaded, list):
+            perception_payload = [item for item in loaded if isinstance(item, dict)]
+
+    keyframe_items: list[tuple[str, str]] = []
+    for item in perception_payload:
+        segment_id = str(item.get("segment_id", "segment"))
+        keyframes = item.get("keyframes", [])
+        if isinstance(keyframes, list):
+            for keyframe in keyframes:
+                keyframe_path = str(keyframe)
+                if Path(keyframe_path).exists():
+                    keyframe_items.append((segment_id, keyframe_path))
+
+    if keyframe_items:
+        for segment_id, keyframe_path in keyframe_items:
+            st.image(keyframe_path, caption=f"{segment_id} | {_frame_caption(keyframe_path)}", use_container_width=True)
+    else:
+        st.info("No keyframes found in perception output.")
+
+    st.markdown("**3) Perception JSON**")
+    if perception_payload:
+        st.json(perception_payload)
+    elif perception_json_path:
+        st.info("Perception JSON not available or empty.")
+    else:
+        st.info("No perception output loaded yet.")
+
+    st.markdown("**4) Final Incident Report**")
+    report_paths = [path for path in st.session_state.get("report_json_paths", []) if Path(path).exists()]
+    if not report_paths and resolved_video_for_view:
+        stem = Path(resolved_video_for_view).stem or "clip"
+        report_paths = services.list_report_files(outputs_dir, stem, show_deprecated=False)
+        st.session_state["report_json_paths"] = report_paths
+
+    selected_report_path = ""
+    selected_report_json: dict[str, Any] | None = None
+    if report_paths:
+        if len(report_paths) == 1:
+            selected_report_path = report_paths[0]
+        else:
+            selected_report_path = st.selectbox("Select report file", options=report_paths, index=0)
+        try:
+            loaded_report = services.load_json(selected_report_path)
+            if isinstance(loaded_report, dict):
+                selected_report_json = loaded_report
+                st.json(selected_report_json)
+        except Exception as exc:
+            st.error(f"Unable to load selected report: {exc}")
+    else:
+        st.info("No report JSON files available yet.")
+
+    st.markdown("**5) Summary Card**")
+    if selected_report_json is not None:
+        try:
+            summary = services.extract_summary(selected_report_json)
+            st.write(f"event_type: `{summary['event_type']}`")
+            st.write(f"severity: `{summary['severity']}`")
+            st.write(f"review_required: `{summary['review_required']}`")
+            st.write(f"number_of_claims: `{summary['claims_count']}`")
+            st.write(f"uncertainty_flags: `{summary['uncertainty_flags']}`")
+        except Exception as exc:
+            st.error(f"Unable to extract summary: {exc}")
+    else:
+        st.info("No report selected for summary.")
+
+    st.markdown("**6) Human Edit Panel**")
+    override_event_type = st.selectbox(
+        "override_event_type",
+        options=["keep", "none", "near_miss", "collision", "obstruction", "violation"],
+        index=0,
+    )
+    override_severity = st.selectbox(
+        "override_severity",
+        options=["keep", "low", "medium", "high", "unknown"],
+        index=0,
+    )
+    reviewer_note = st.text_area("reviewer_note", value="", height=100)
+
+    if st.button("Save Reviewed Copy", use_container_width=True):
+        try:
+            if not selected_report_path:
+                raise ValueError("No report file selected.")
+            reviewed_path = services.save_reviewed_copy(
+                report_path=selected_report_path,
+                override_event_type=override_event_type,
+                override_severity=override_severity,
+                reviewer_note=reviewer_note,
+            )
+            st.success(f"Reviewed copy saved: {reviewed_path}")
+        except Exception as exc:
+            st.error(f"Failed to save reviewed copy: {exc}")
+
+st.divider()
+st.subheader("Road-User Detection & Tracking (Local)")
+st.caption("Local-only detection and multi-object tracking with CSV/JSON exports and annotated video.")
+
+with st.container(border=True):
+    dt_col_inputs, dt_col_outputs = st.columns([1, 2])
+
+    with dt_col_inputs:
+        default_dt_video = st.session_state.get("resolved_video_path") or "data/raw_videos/cctv_006.mp4"
+        dt_video_path = st.text_input("Video path", value=default_dt_video, key="dt_video_path")
+        dt_model = st.text_input("Model (blank=auto)", value="", key="dt_model")
+        dt_tracker = st.selectbox("Tracker", options=["botsort.yaml", "bytetrack.yaml"], index=0, key="dt_tracker")
+        dt_classes = st.multiselect(
+            "Classes",
+            options=["person", "bicycle", "car", "motorcycle", "bus", "truck"],
+            default=["person", "bicycle", "car", "motorcycle", "bus", "truck"],
+            key="dt_classes",
+        )
+        dt_conf = st.slider("Confidence", min_value=0.05, max_value=0.95, value=0.25, step=0.05, key="dt_conf")
+        dt_iou = st.slider("IOU", min_value=0.1, max_value=0.9, value=0.5, step=0.05, key="dt_iou")
+        dt_save_annotated = st.checkbox("Save annotated video", value=True, key="dt_save_annotated")
+
+        if st.button("Run Detect+Track", use_container_width=True, key="run_detecttrack"):
+            try:
+                with st.spinner("Running detect+track..."):
+                    result = services.run_detecttrack(
+                        video_path=dt_video_path,
+                        outputs_dir=outputs_dir,
+                        model_name=dt_model.strip() or None,
+                        tracker=dt_tracker,
+                        conf=float(dt_conf),
+                        iou=float(dt_iou),
+                        classes=dt_classes,
+                        save_annotated=dt_save_annotated,
+                    )
+                st.session_state["detecttrack_result"] = result
+                st.success(
+                    f"Detection+Tracking complete. detections={result['num_detections']} tracks={result['num_tracks']}"
+                )
+            except Exception as exc:
+                st.error(f"Detect+Track failed: {exc}")
+
+    with dt_col_outputs:
+        detecttrack_result = st.session_state.get("detecttrack_result", {})
+        tracks_csv_path = str(detecttrack_result.get("tracks_csv", ""))
+        summary_json_path = str(detecttrack_result.get("summary_json", ""))
+        annotated_video_path = detecttrack_result.get("annotated_video")
+
+        if tracks_csv_path and Path(tracks_csv_path).exists() and summary_json_path and Path(summary_json_path).exists():
+            try:
+                tracks_df = services.load_tracks_csv(tracks_csv_path)
+                summary_payload = services.load_json(summary_json_path)
+                if not isinstance(summary_payload, dict):
+                    raise ValueError("Track summary JSON is not an object")
+
+                detections = int(summary_payload.get("num_detections", len(tracks_df.index)))
+                unique_tracks = int(summary_payload.get("tracks", []) and len(summary_payload.get("tracks", [])))
+                classes_found = int(len(summary_payload.get("class_counts", {})))
+                kpi1, kpi2, kpi3 = st.columns(3)
+                kpi1.metric("Detections", detections)
+                kpi2.metric("Unique Tracks", unique_tracks)
+                kpi3.metric("Classes Found", classes_found)
+
+                st.markdown("**Tracks Preview (first 50 rows)**")
+                st.dataframe(tracks_df.head(50), use_container_width=True)
+
+                class_counts = summary_payload.get("class_counts", {})
+                if isinstance(class_counts, dict) and class_counts:
+                    import pandas as pd
+
+                    class_df = pd.DataFrame(
+                        [{"class_name": str(name), "count": int(count)} for name, count in class_counts.items()]
+                    ).sort_values(by="count", ascending=False)
+                    st.markdown("**Class Distribution**")
+                    st.dataframe(class_df, use_container_width=True)
+                else:
+                    st.info("No class distribution available.")
+
+                if annotated_video_path and Path(str(annotated_video_path)).exists():
+                    st.markdown("**Annotated Video**")
+                    _render_video(str(annotated_video_path))
+
+                csv_bytes = Path(tracks_csv_path).read_bytes()
+                json_bytes = Path(summary_json_path).read_bytes()
+                dl_col1, dl_col2 = st.columns(2)
+                with dl_col1:
+                    st.download_button(
+                        label="Download Tracks CSV",
+                        data=csv_bytes,
+                        file_name=Path(tracks_csv_path).name,
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                with dl_col2:
+                    st.download_button(
+                        label="Download Summary JSON",
+                        data=json_bytes,
+                        file_name=Path(summary_json_path).name,
+                        mime="application/json",
+                        use_container_width=True,
+                    )
+            except Exception as exc:
+                st.error(f"Unable to render detect+track outputs: {exc}")
+        else:
+            st.info("Run Detect+Track to generate tracking outputs.")
+
+st.divider()
+st.subheader("Evidence Review Mode (Recommended)")
+
+evidence_video_path = st.session_state.get("resolved_video_path") or video_path_input
+evidence_video_stem = Path(evidence_video_path).stem or "clip"
+evidence_frames_json = st.session_state.get("frames_json_path") or str(Path(outputs_dir) / f"{evidence_video_stem}_frames.json")
+evidence_perception_json = st.session_state.get("perception_json_path") or str(
+    Path(outputs_dir) / f"{evidence_video_stem}_perception.json"
+)
+
+show_deprecated = st.checkbox("show deprecated reports", value=False, key="show_deprecated_reports")
+report_candidates = services.list_report_files(outputs_dir, evidence_video_stem, show_deprecated=show_deprecated)
+
+if not Path(evidence_perception_json).exists() or not report_candidates:
+    st.info("Run pipeline first: perception JSON and report JSON are required for Evidence Review Mode.")
+else:
+    try:
+        perception_raw = services.load_json(evidence_perception_json)
+        perception_items = [item for item in perception_raw if isinstance(item, dict)] if isinstance(perception_raw, list) else []
+    except Exception as exc:
+        perception_items = []
+        st.error(f"Could not load perception JSON: {exc}")
+
+    if not perception_items:
+        st.info("Perception output is empty. Run perceive step first.")
+    else:
+        left_panel, right_panel = st.columns([1, 1], gap="large")
+
+        with right_panel:
+            st.markdown("### Incident Assessment")
+            report_path = st.selectbox("Report", options=report_candidates, index=0, key="evidence_report_path")
+            report_payload_raw = services.load_json(report_path)
+            report_payload = report_payload_raw if isinstance(report_payload_raw, dict) else {}
+
+            report_meta = report_payload.get("meta", {})
+            source_video_from_report = (
+                str(report_meta.get("source_video", "")).strip() if isinstance(report_meta, dict) else ""
+            ) or evidence_video_path
+
+            report_segment = {}
+            segments = report_payload.get("segments", [])
+            if isinstance(segments, list) and segments and isinstance(segments[0], dict):
+                report_segment = segments[0]
+            report_segment_id = str(report_segment.get("segment_id", "")).strip()
+
+            segment_options = [str(item.get("segment_id", f"segment_{idx+1}")) for idx, item in enumerate(perception_items)]
+            default_segment_idx = segment_options.index(report_segment_id) if report_segment_id in segment_options else 0
+            selected_segment_id = st.selectbox(
+                "Segment",
+                options=segment_options,
+                index=default_segment_idx,
+                key="evidence_segment_selector",
+            )
+            selected_perception = next(
+                (item for item in perception_items if str(item.get("segment_id", "")) == selected_segment_id),
+                perception_items[default_segment_idx],
+            )
+
+            claims = report_segment.get("claims", []) if isinstance(report_segment, dict) else []
+            claims = [claim for claim in claims if isinstance(claim, dict)]
+            claim_options = ["all"] + [str(claim.get("claim_id", "claim")) for claim in claims]
+            selected_claim_id = st.selectbox("Claim Focus", options=claim_options, index=0, key="evidence_claim_focus")
+            selected_claim = next((c for c in claims if str(c.get("claim_id", "")) == selected_claim_id), None)
+
+            summary = services.extract_summary(report_payload)
+            seg_start = float(selected_perception.get("start_sec", report_segment.get("start_sec", 0.0)))
+            seg_end = float(selected_perception.get("end_sec", report_segment.get("end_sec", seg_start)))
+            st.markdown('<div class="tir-card">', unsafe_allow_html=True)
+            st.write(f"event_type: `{summary['event_type']}`")
+            st.write(f"severity: `{summary['severity']}`")
+            st.write(f"review_required: `{'Yes' if summary['review_required'] else 'No'}`")
+            st.write(f"segment window: `{seg_start:.2f}s - {seg_end:.2f}s`")
+            st.write(f"number_of_claims: `{summary['claims_count']}`")
+            st.write(f"uncertainty flags: `{summary['uncertainty_flags']}`")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            st.markdown("**Claims & Evidence**")
+            if claims:
+                keyframes_for_segment = selected_perception.get("keyframes", [])
+                keyframes_for_segment = [str(path) for path in keyframes_for_segment] if isinstance(keyframes_for_segment, list) else []
+                tracks_csv_path = services.resolve_tracks_csv_for_report(report_path, source_video_from_report)
+
+                for claim in claims:
+                    claim_id = str(claim.get("claim_id", "claim"))
+                    support_info = services.evaluate_claim_visual_support(
+                        claim=claim,
+                        keyframe_paths=keyframes_for_segment,
+                        frames_json_path=evidence_frames_json if Path(evidence_frames_json).exists() else None,
+                        video_path=source_video_from_report,
+                        tracks_csv_path=tracks_csv_path,
+                    )
+                    header = (
+                        f"{claim_id} | conf={float(claim.get('support_confidence', 0.0)):.2f} | "
+                        f"visual={support_info['visual_support_level']}"
+                    )
+                    with st.expander(header, expanded=(selected_claim_id == claim_id)):
+                        st.write(f"statement: {claim.get('statement', '')}")
+                        evidence_frames = claim.get("evidence_frames", [])
+                        if isinstance(evidence_frames, list) and evidence_frames:
+                            st.write(f"evidence_frames: {evidence_frames}")
+                        else:
+                            st.write("evidence_frames: No explicit frame links")
+                        st.write(f"uncertainty_flags: {claim.get('uncertainty_flags', [])}")
+                        st.write(f"has_visual_boxes_any_evidence_frame: {support_info['has_visual_boxes_any_evidence_frame']}")
+            else:
+                st.info("No claims in selected report.")
+
+            st.markdown("**Actors**")
+            actors = report_payload.get("actors", [])
+            if isinstance(actors, list) and actors:
+                import pandas as pd
+
+                actor_rows = []
+                for actor in actors:
+                    if isinstance(actor, dict):
+                        actor_rows.append(
+                            {
+                                "actor_id": actor.get("actor_id", ""),
+                                "role": actor.get("role", ""),
+                                "description": actor.get("description", ""),
+                            }
+                        )
+                st.dataframe(pd.DataFrame(actor_rows), use_container_width=True)
+            else:
+                st.info("No actors available.")
+
+            st.markdown("**Audit & Provenance**")
+            audit = report_payload.get("audit", {})
+            notes = str(audit.get("notes", "")) if isinstance(audit, dict) else ""
+            track_source = services.resolve_tracks_csv_for_report(report_path, source_video_from_report)
+            track_exists = bool(track_source and Path(track_source).exists())
+            track_mtime = ""
+            if track_exists and track_source:
+                track_mtime = datetime.fromtimestamp(Path(track_source).stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+
+            kv_rows = []
+            if isinstance(report_meta, dict):
+                kv_rows.append({"key": "report_id", "value": str(report_meta.get("report_id", ""))})
+                kv_rows.append({"key": "created_at", "value": str(report_meta.get("created_at", ""))})
+            kv_rows.append({"key": "track_source", "value": str(track_source) if track_source else "not found"})
+            kv_rows.append({"key": "track_exists", "value": "Yes" if track_exists else "No"})
+            if track_mtime:
+                kv_rows.append({"key": "track_last_modified", "value": track_mtime})
+            primary_keys = {str(row["key"]).strip().lower() for row in kv_rows}
+            for pair in _parse_audit_notes_pairs(notes):
+                if str(pair.get("key", "")).strip().lower() in primary_keys:
+                    continue
+                kv_rows.append(pair)
+
+            kv_html = '<table class="tir-kv">' + "".join(
+                f"<tr><td>{row['key']}</td><td>{row['value']}</td></tr>" for row in kv_rows
+            ) + "</table>"
+            st.markdown(kv_html, unsafe_allow_html=True)
+
+            st.markdown("**Human Review**")
+            override_event_type_ev = st.selectbox(
+                "override_event_type",
+                options=["keep", "none", "near_miss", "collision", "obstruction", "violation"],
+                index=0,
+                key="evidence_override_event_type",
+            )
+            override_severity_ev = st.selectbox(
+                "override_severity",
+                options=["keep", "low", "medium", "high", "unknown"],
+                index=0,
+                key="evidence_override_severity",
+            )
+            reviewer_note_ev = st.text_area("reviewer_note", value="", height=90, key="evidence_reviewer_note")
+            if st.button("Save Reviewed Copy", use_container_width=True, key="evidence_save_reviewed"):
+                try:
+                    reviewed_path = services.save_reviewed_copy(
+                        report_path=report_path,
+                        override_event_type=override_event_type_ev,
+                        override_severity=override_severity_ev,
+                        reviewer_note=reviewer_note_ev,
+                    )
+                    st.success(f"Reviewed copy saved: {reviewed_path}")
+                except Exception as exc:
+                    st.error(f"Failed to save reviewed copy: {exc}")
+
+        with left_panel:
+            st.markdown("### Incident Video")
+            playback_mode = st.radio(
+                "Playback mode",
+                options=["Guided keyframes (recommended)", "Play full annotated clip"],
+                index=0,
+                key="evidence_playback_mode",
+            )
+            annotated_candidate = None
+            detect_result = st.session_state.get("detecttrack_result", {})
+            if detect_result.get("annotated_video") and Path(str(detect_result["annotated_video"])).exists():
+                annotated_candidate = str(detect_result["annotated_video"])
+            else:
+                candidate_webm = Path(outputs_dir) / f"{evidence_video_stem}_annotated.webm"
+                candidate_mp4 = Path(outputs_dir) / f"{evidence_video_stem}_annotated.mp4"
+                if candidate_webm.exists():
+                    annotated_candidate = str(candidate_webm)
+                elif candidate_mp4.exists():
+                    annotated_candidate = str(candidate_mp4)
+
+            if playback_mode == "Play full annotated clip":
+                st.info("Use this for context; decisions are based on evidence frames.")
+            if annotated_candidate:
+                candidate_path = Path(annotated_candidate)
+                if candidate_path.stat().st_size <= 0:
+                    st.warning("Annotated video file is empty. Re-run Detect+Track to regenerate it.")
+                else:
+                    _render_video(annotated_candidate)
+            else:
+                st.info("Annotated video not found. Run Detect+Track with annotated output enabled.")
+
+            st.markdown("### Evidence Frame Inspector")
+            keyframes_raw = selected_perception.get("keyframes", [])
+            keyframes_all = [str(path) for path in keyframes_raw] if isinstance(keyframes_raw, list) else []
+            existing_keyframes = [path for path in keyframes_all if Path(path).exists()]
+            missing_count = len(keyframes_all) - len(existing_keyframes)
+            if missing_count > 0:
+                st.warning(f"{missing_count} keyframe files are missing and were skipped.")
+
+            keyframes_filtered = (
+                services.map_claim_to_keyframes(selected_claim, existing_keyframes) if selected_claim else existing_keyframes
+            )
+            if not keyframes_filtered and selected_claim:
+                st.info("Selected claim has no direct keyframe links. Showing all segment keyframes.")
+                keyframes_filtered = existing_keyframes
+
+            if not keyframes_filtered:
+                st.info("No keyframes available for this segment.")
+            else:
+                keyframe_meta_rows: list[tuple[str, str, dict[str, Any]]] = []
+                for keyframe_path in keyframes_filtered:
+                    meta = services.resolve_keyframe_metadata(
+                        keyframe_path=keyframe_path,
+                        frames_json_path=evidence_frames_json if Path(evidence_frames_json).exists() else None,
+                        video_path=source_video_from_report,
+                        fallback_fps=2.0,
+                    )
+                    sampled_idx = meta.get("sampled_frame_idx")
+                    source_idx = meta.get("source_frame_idx")
+                    timestamp = meta.get("timestamp_sec")
+                    quality = meta.get("mapping_quality", "fallback")
+                    label = (
+                        f"kf={sampled_idx if sampled_idx is not None else 'na'} | "
+                        f"src={source_idx if source_idx is not None else 'na'} | "
+                        f"t={(float(timestamp) if timestamp is not None else -1):.2f}s | "
+                        f"map={quality}"
+                    )
+                    keyframe_meta_rows.append((label, keyframe_path, meta))
+
+                labels = [row[0] for row in keyframe_meta_rows]
+                selected_label = st.selectbox("Keyframe", options=labels, index=0, key="evidence_keyframe_label")
+                selected_row = next(row for row in keyframe_meta_rows if row[0] == selected_label)
+                selected_keyframe_path = selected_row[1]
+                selected_meta = selected_row[2]
+
+                if str(selected_meta.get("mapping_quality", "fallback")) != "exact":
+                    st.warning(f"Mapping quality is `{selected_meta.get('mapping_quality')}`; timestamp may be approximate.")
+
+                track_source_path = services.resolve_tracks_csv_for_report(report_path, source_video_from_report)
+                ts_sec = selected_meta.get("timestamp_sec")
+                box_render_path = Path(outputs_dir) / "_rendered_frames" / (
+                    f"{Path(selected_keyframe_path).stem}_track_overlay.jpg"
+                )
+                box_meta = services.render_keyframe_with_tracks(
+                    keyframe_image_path=selected_keyframe_path,
+                    keyframe_timestamp_sec=float(ts_sec) if ts_sec is not None else None,
+                    tracks_csv_path=track_source_path,
+                    out_path=str(box_render_path),
+                    video_path=source_video_from_report,
+                )
+
+                top_claim = selected_claim
+                if top_claim is None and claims:
+                    top_claim = max(claims, key=lambda c: float(c.get("support_confidence", 0.0)))
+                top_claim_id = str(top_claim.get("claim_id", "n/a")) if isinstance(top_claim, dict) else "n/a"
+                top_event = str(top_claim.get("event_type", summary["event_type"])) if isinstance(top_claim, dict) else summary["event_type"]
+                top_conf = float(top_claim.get("support_confidence", 0.0)) if isinstance(top_claim, dict) else 0.0
+
+                overlay_lines = [
+                    f"t={(float(ts_sec) if ts_sec is not None else -1):.2f}s",
+                    f"segment={selected_segment_id}",
+                    f"claim={top_claim_id}",
+                    f"event={top_event} conf={top_conf:.2f}",
+                ]
+                overlay_path = services.render_annotated_keyframe(
+                    image_path=str(box_render_path),
+                    output_path="",
+                    overlay_lines=overlay_lines,
+                )
+                st.image(overlay_path, use_container_width=True)
+                st.caption(f"Evidence frame {labels.index(selected_label) + 1} of {len(labels)}")
+                st.caption(f"Matched boxes: {box_meta['boxes_drawn']} (rows={box_meta['matched_rows']})")
+
+                if selected_claim is not None:
+                    support = services.evaluate_claim_visual_support(
+                        claim=selected_claim,
+                        keyframe_paths=existing_keyframes,
+                        frames_json_path=evidence_frames_json if Path(evidence_frames_json).exists() else None,
+                        video_path=source_video_from_report,
+                        tracks_csv_path=track_source_path,
+                    )
+                    strongest = support.get("strongest_evidence_frame")
+                    st.write(f"visual_support_level: `{support['visual_support_level']}`")
+                    if (
+                        str(selected_claim.get("event_type", "")) == "collision"
+                        and strongest
+                        and strongest != selected_keyframe_path
+                    ):
+                        st.info(
+                            "Selected frame is context; inspect strongest evidence frame for peak event visibility."
+                        )
+                        if st.button("Jump to strongest evidence frame", key="jump_strongest_evidence"):
+                            target = next(
+                                (label for label, path, _meta in keyframe_meta_rows if path == strongest),
+                                None,
+                            )
+                            if target is not None:
+                                st.session_state["evidence_keyframe_label"] = target
+                                st.rerun()

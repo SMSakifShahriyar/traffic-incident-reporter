@@ -1,0 +1,680 @@
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src import cli
+from src.involvement import normalize_involvement_response, resolve_claim_involvement, run_involvement_for_report
+
+
+def test_normalize_involvement_response_filters_ids_and_fallback() -> None:
+    normalized = normalize_involvement_response(
+        payload={
+            "primary_track_ids": [24, 999, "118"],
+            "secondary_track_ids": [24, 100, "x"],
+            "decision_confidence": 1.2,
+            "rationale": "Clear impact pair.",
+            "ambiguity_flags": ["occlusion", "occlusion", ""],
+        },
+        candidate_track_ids=[24, 100, 118],
+        fallback_primary=[100, 118],
+    )
+    assert normalized["primary_track_ids"] == [24, 118]
+    assert normalized["secondary_track_ids"] == [100]
+    assert abs(normalized["decision_confidence"] - 1.0) < 1e-9
+    assert normalized["ambiguity_flags"] == ["occlusion"]
+
+
+def test_run_involvement_for_report_fallback_mode(tmp_path: Path) -> None:
+    report_json = tmp_path / "report.json"
+    perception_json = tmp_path / "perception.json"
+    frames_json = tmp_path / "frames.json"
+    tracks_csv = tmp_path / "tracks.csv"
+    out_json = tmp_path / "involvement.json"
+
+    report_json.write_text(
+        json.dumps(
+            {
+                "meta": {"source_video": "data/raw_videos/demo.mp4"},
+                "segments": [
+                    {
+                        "segment_id": "s_collision",
+                        "claims": [
+                            {
+                                "claim_id": "clm_001",
+                                "event_type": "collision",
+                                "statement": "Collision observed.",
+                                "support_confidence": 0.95,
+                                "evidence_frames": [8, 10],
+                                "uncertainty_flags": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    perception_json.write_text(
+        json.dumps(
+            [
+                {
+                    "segment_id": "s_collision",
+                    "start_sec": 4.0,
+                    "end_sec": 10.0,
+                    "keyframes": [
+                        "data/frame_cache/demo/f_000008.jpg",
+                        "data/frame_cache/demo/f_000010.jpg",
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    frames_json.write_text(
+        json.dumps(
+            {
+                "frames": [
+                    {"frame_id": 8, "orig_frame_idx": 120, "time_sec": 4.0, "path": "data/frame_cache/demo/f_000008.jpg"},
+                    {"frame_id": 10, "orig_frame_idx": 150, "time_sec": 5.0, "path": "data/frame_cache/demo/f_000010.jpg"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    tracks_csv.write_text(
+        "\n".join(
+            [
+                "frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2",
+                "120,4.00,100,2,car,0.91,10,10,60,60",
+                "120,4.00,118,2,car,0.89,20,20,70,70",
+                "150,5.00,100,2,car,0.93,11,11,61,61",
+                "150,5.00,118,2,car,0.90,21,21,71,71",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_involvement_for_report(
+        report_json_path=report_json,
+        perception_json_path=perception_json,
+        frames_json_path=frames_json,
+        tracks_csv_path=tracks_csv,
+        out_json_path=out_json,
+        model="gpt-4.1-mini",
+        use_ai=False,
+    )
+    assert result["claims"] == 1
+    assert result["ai_used"] == 0
+    assert out_json.exists()
+
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert isinstance(payload.get("claims"), list)
+    claim = payload["claims"][0]
+    assert claim["method"] == "heuristic_fallback"
+    assert len(claim["primary_track_ids"]) >= 1
+    assert "grounded_statement" in claim
+    assert "track" in str(claim["grounded_statement"]).lower()
+    assert "motion context" in str(claim["grounded_statement"]).lower()
+
+
+def test_involve_cli_argument_parsing() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "involve",
+            "--report-json",
+            "data/outputs/reports/cctv_006_s_collision_report.json",
+            "--perception-json",
+            "data/outputs/cctv_006_perception.json",
+            "--frames-json",
+            "data/outputs/cctv_006_frames.json",
+            "--tracks-csv",
+            "data/outputs/cctv_006_tracks.csv",
+            "--out-json",
+            "data/outputs/cctv_006_involvement.json",
+            "--model",
+            "gpt-4.1-mini",
+            "--max-frames",
+            "6",
+            "--no-ai",
+        ]
+    )
+    assert args.command == "involve"
+    assert args.no_ai is True
+    assert args.max_frames == 6
+
+
+def test_rebuild_cli_argument_parsing() -> None:
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "rebuild",
+            "--video",
+            "data/raw_videos/cctv_006.mp4",
+            "--out-dir",
+            "data/outputs",
+            "--model",
+            "gpt-4.1-mini",
+            "--max-frames",
+            "12",
+            "--tracker",
+            "botsort.yaml",
+        ]
+    )
+    assert args.command == "rebuild"
+    assert args.video.endswith("cctv_006.mp4")
+    assert args.max_frames == 12
+    assert args.tracker == "botsort.yaml"
+
+
+def test_resolve_claim_involvement_collision_anchor_priority(monkeypatch) -> None:
+    claim = {
+        "claim_id": "clm_001",
+        "event_type": "collision",
+        "statement": "Collision observed between two cars.",
+        "support_confidence": 0.95,
+        "evidence_frames": [8, 10, 13],
+    }
+    perception_item = {
+        "segment_id": "s_collision",
+        "keyframes": [
+            "data/frame_cache/demo/f_000008.jpg",
+            "data/frame_cache/demo/f_000010.jpg",
+            "data/frame_cache/demo/f_000013.jpg",
+        ],
+    }
+
+    monkeypatch.setattr(
+        "src.involvement.services.evaluate_claim_visual_support",
+        lambda **_kwargs: {
+            "has_visual_boxes_any_evidence_frame": True,
+            "strongest_evidence_frame": "data/frame_cache/demo/f_000013.jpg",
+            "visual_support_level": "strong",
+            "strongest_boxes": 9,
+        },
+    )
+    monkeypatch.setattr(
+        "src.involvement.services.summarize_claim_track_evidence",
+        lambda **_kwargs: {
+            "track_ids": [21, 24, 68, 100, 118],
+            "involved_track_ids": [24, 118],
+            "tracks": [
+                {"track_id": 21, "class_name": "car", "boxes": 6, "max_conf": 0.88},
+                {"track_id": 68, "class_name": "car", "boxes": 6, "max_conf": 0.8},
+                {"track_id": 100, "class_name": "car", "boxes": 6, "max_conf": 0.85},
+                {"track_id": 118, "class_name": "car", "boxes": 4, "max_conf": 0.9},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "src.involvement.services.resolve_keyframe_metadata",
+        lambda **_kwargs: {
+            "sampled_frame_idx": 13,
+            "source_frame_idx": 195,
+            "timestamp_sec": 6.5,
+            "mapping_quality": "exact",
+        },
+    )
+    monkeypatch.setattr(
+        "src.involvement.services.tracks_at_timestamp",
+        lambda **_kwargs: {
+            "matched": True,
+            "matched_timestamp_sec": 6.5,
+            "rows": [
+                {"track_id": 21, "class_name": "car", "conf": 0.88, "x1": 319, "y1": 75, "x2": 412, "y2": 114},
+                {"track_id": 68, "class_name": "car", "conf": 0.79, "x1": 488, "y1": 47, "x2": 521, "y2": 78},
+                {"track_id": 100, "class_name": "car", "conf": 0.80, "x1": 120, "y1": 114, "x2": 176, "y2": 156},
+                {"track_id": 118, "class_name": "car", "conf": 0.86, "x1": 164, "y1": 98, "x2": 259, "y2": 147},
+            ],
+        },
+    )
+
+    class _FakeClient:
+        def respond_json_with_images(self, **_kwargs):
+            return {
+                "primary_track_ids": [21, 68],
+                "secondary_track_ids": [24, 118],
+                "decision_confidence": 0.9,
+                "rationale": "Model selected two visible cars.",
+                "ambiguity_flags": [],
+            }
+
+    monkeypatch.setattr(
+        "src.involvement.OpenAIResponsesClient.from_env",
+        lambda: _FakeClient(),
+    )
+
+    result = resolve_claim_involvement(
+        claim=claim,
+        perception_item=perception_item,
+        frames_json_path="data/outputs/demo_frames.json",
+        video_path="data/raw_videos/demo.mp4",
+        tracks_csv_path="data/outputs/demo_tracks.csv",
+        model="gpt-4.1-mini",
+        max_frames=6,
+        max_retries=1,
+        use_ai=True,
+    )
+
+    assert result["method"] == "ai"
+    assert result["impact_anchor_pair_hint"] == [100, 118]
+    assert result["ai_primary_track_ids"] == [21, 68]
+    assert result["primary_track_ids"] == [100, 118]
+    assert "ai_anchor_adjusted" in result["ambiguity_flags"]
+
+
+def test_resolve_claim_involvement_uses_rendered_id_keyframes_for_ai(monkeypatch) -> None:
+    claim = {
+        "claim_id": "clm_001",
+        "event_type": "collision",
+        "statement": "Collision observed between two cars.",
+        "support_confidence": 0.95,
+        "evidence_frames": [5, 6, 7],
+    }
+    perception_item = {
+        "segment_id": "s2",
+        "start_sec": 2.5,
+        "end_sec": 5.0,
+        "keyframes": [
+            "data/frame_cache/demo/f_000005.jpg",
+            "data/frame_cache/demo/f_000006.jpg",
+            "data/frame_cache/demo/f_000007.jpg",
+        ],
+    }
+
+    monkeypatch.setattr(
+        "src.involvement.services.evaluate_claim_visual_support",
+        lambda **_kwargs: {
+            "has_visual_boxes_any_evidence_frame": True,
+            "strongest_evidence_frame": "data/frame_cache/demo/f_000006.jpg",
+            "visual_support_level": "strong",
+            "strongest_boxes": 7,
+        },
+    )
+    monkeypatch.setattr(
+        "src.involvement.services.summarize_claim_track_evidence",
+        lambda **_kwargs: {
+            "track_ids": [3, 5, 6],
+            "involved_track_ids": [3, 5],
+            "tracks": [
+                {"track_id": 3, "class_name": "car", "boxes": 6, "max_conf": 0.91},
+                {"track_id": 5, "class_name": "car", "boxes": 6, "max_conf": 0.88},
+                {"track_id": 6, "class_name": "car", "boxes": 6, "max_conf": 0.85},
+            ],
+            "impact_pair_candidates": [
+                {"pair": [3, 5], "peak_timestamp_sec": 3.0, "peak_score": 0.38, "selection_score": 0.38},
+                {"pair": [5, 6], "peak_timestamp_sec": 5.0, "peak_score": 0.27, "selection_score": 0.27},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "src.involvement.services.resolve_keyframe_metadata",
+        lambda **_kwargs: {
+            "sampled_frame_idx": 6,
+            "source_frame_idx": 90,
+            "timestamp_sec": 3.0,
+            "mapping_quality": "exact",
+        },
+    )
+    monkeypatch.setattr(
+        "src.involvement.services.tracks_at_timestamp",
+        lambda **_kwargs: {
+            "matched": True,
+            "matched_timestamp_sec": 3.0,
+            "rows": [
+                {"track_id": 3, "class_name": "car", "conf": 0.91, "x1": 10, "y1": 10, "x2": 60, "y2": 60},
+                {"track_id": 5, "class_name": "car", "conf": 0.88, "x1": 40, "y1": 12, "x2": 90, "y2": 62},
+            ],
+        },
+    )
+    rendered_paths = [
+        "data/outputs/_rendered_frames/involvement_ai/f_000005_rendered.jpg",
+        "data/outputs/_rendered_frames/involvement_ai/f_000006_rendered.jpg",
+        "data/outputs/_rendered_frames/involvement_ai/f_000007_rendered.jpg",
+    ]
+    monkeypatch.setattr(
+        "src.involvement._render_keyframes_for_involvement_ai",
+        lambda **_kwargs: rendered_paths,
+    )
+
+    seen_image_paths: list[list[str]] = []
+
+    class _FakeClient:
+        def respond_json_with_images(self, **kwargs):
+            seen_image_paths.append(list(kwargs.get("image_paths", [])))
+            return {
+                "primary_track_ids": [3, 5],
+                "secondary_track_ids": [6],
+                "decision_confidence": 0.95,
+                "rationale": "Tracks 3 and 5 are direct collision participants.",
+                "ambiguity_flags": [],
+                "statement": "Between 2.50s and 5.00s, track 3 and track 5 collide near 3.00s.",
+            }
+
+    monkeypatch.setattr(
+        "src.involvement.OpenAIResponsesClient.from_env",
+        lambda: _FakeClient(),
+    )
+
+    result = resolve_claim_involvement(
+        claim=claim,
+        perception_item=perception_item,
+        frames_json_path="data/outputs/demo_frames.json",
+        video_path="data/raw_videos/demo.mp4",
+        tracks_csv_path="data/outputs/demo_tracks.csv",
+        model="gpt-4.1",
+        max_frames=6,
+        max_retries=1,
+        use_ai=True,
+    )
+
+    assert result["ai_keyframes_used"] == rendered_paths
+    assert seen_image_paths
+    assert seen_image_paths[0] == rendered_paths
+
+
+def test_resolve_claim_involvement_keeps_high_conf_ai_pair_with_anchor_overlap(monkeypatch) -> None:
+    claim = {
+        "claim_id": "clm_001",
+        "event_type": "collision",
+        "statement": "Collision observed.",
+        "support_confidence": 0.95,
+        "evidence_frames": [5, 6, 7, 8, 9, 10],
+    }
+    perception_item = {
+        "segment_id": "s1",
+        "start_sec": 2.5,
+        "end_sec": 5.0,
+        "keyframes": [
+            "data/frame_cache/demo/f_000005.jpg",
+            "data/frame_cache/demo/f_000006.jpg",
+            "data/frame_cache/demo/f_000007.jpg",
+        ],
+    }
+
+    monkeypatch.setattr(
+        "src.involvement.services.evaluate_claim_visual_support",
+        lambda **_kwargs: {
+            "has_visual_boxes_any_evidence_frame": True,
+            "strongest_evidence_frame": "data/frame_cache/demo/f_000006.jpg",
+            "visual_support_level": "strong",
+            "strongest_boxes": 8,
+        },
+    )
+    monkeypatch.setattr(
+        "src.involvement.services.summarize_claim_track_evidence",
+        lambda **_kwargs: {
+            "track_ids": [3, 5, 6, 9],
+            "involved_track_ids": [3, 5],
+            "tracks": [
+                {"track_id": 3, "class_name": "car", "boxes": 6, "max_conf": 0.92},
+                {"track_id": 5, "class_name": "car", "boxes": 6, "max_conf": 0.90},
+                {"track_id": 6, "class_name": "car", "boxes": 6, "max_conf": 0.91},
+            ],
+                                                                          
+            "impact_pair_candidates": [
+                {"pair": [3, 5], "peak_timestamp_sec": 3.0, "peak_score": 0.38, "selection_score": 0.38},
+                {"pair": [5, 6], "peak_timestamp_sec": 5.0, "peak_score": 0.27, "selection_score": 0.27},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "src.involvement.services.resolve_keyframe_metadata",
+        lambda **_kwargs: {
+            "sampled_frame_idx": 6,
+            "source_frame_idx": 90,
+            "timestamp_sec": 3.0,
+            "mapping_quality": "exact",
+        },
+    )
+    monkeypatch.setattr(
+        "src.involvement.services.tracks_at_timestamp",
+        lambda **_kwargs: {
+            "matched": True,
+            "matched_timestamp_sec": 3.0,
+            "rows": [
+                {"track_id": 3, "class_name": "car", "conf": 0.90, "x1": 10, "y1": 10, "x2": 60, "y2": 60},
+                {"track_id": 5, "class_name": "car", "conf": 0.91, "x1": 45, "y1": 12, "x2": 95, "y2": 62},
+                {"track_id": 6, "class_name": "car", "conf": 0.92, "x1": 18, "y1": 14, "x2": 68, "y2": 64},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "src.involvement._render_keyframes_for_involvement_ai",
+        lambda **_kwargs: [
+            "data/outputs/_rendered_frames/involvement_ai/f_000005_rendered.jpg",
+            "data/outputs/_rendered_frames/involvement_ai/f_000006_rendered.jpg",
+        ],
+    )
+
+    class _FakeClient:
+        def respond_json_with_images(self, **_kwargs):
+            return {
+                "primary_track_ids": [6, 3],
+                "secondary_track_ids": [5],
+                "decision_confidence": 0.95,
+                "rationale": "tracks 6 and 3 collide directly",
+                "ambiguity_flags": [],
+                "statement": "track 6 and track 3 collide",
+            }
+
+    monkeypatch.setattr("src.involvement.OpenAIResponsesClient.from_env", lambda: _FakeClient())
+
+    result = resolve_claim_involvement(
+        claim=claim,
+        perception_item=perception_item,
+        frames_json_path="data/outputs/demo_frames.json",
+        video_path="data/raw_videos/demo.mp4",
+        tracks_csv_path="data/outputs/demo_tracks.csv",
+        model="gpt-4.1",
+        max_frames=6,
+        max_retries=1,
+        use_ai=True,
+    )
+
+    assert set(result["primary_track_ids"]) == {3, 6}
+    assert "ai_anchor_adjusted" not in result.get("ambiguity_flags", [])
+
+
+def test_run_involvement_derives_secondary_collision_claim(tmp_path: Path, monkeypatch) -> None:
+    report_json = tmp_path / "report.json"
+    perception_json = tmp_path / "perception.json"
+    out_json = tmp_path / "involvement.json"
+
+    report_json.write_text(
+        json.dumps(
+            {
+                "meta": {"source_video": "data/raw_videos/demo.mp4"},
+                "segments": [
+                    {
+                        "segment_id": "s1",
+                        "claims": [
+                            {
+                                "claim_id": "clm_001",
+                                "event_type": "collision",
+                                "statement": "Collision observed.",
+                                "support_confidence": 0.9,
+                                "evidence_frames": [9, 10, 11],
+                                "uncertainty_flags": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    perception_json.write_text(
+        json.dumps(
+            [
+                {
+                    "segment_id": "s1",
+                    "start_sec": 4.3,
+                    "end_sec": 8.3,
+                    "keyframes": [
+                        "data/frame_cache/demo/f_000009.jpg",
+                        "data/frame_cache/demo/f_000011.jpg",
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def _fake_resolve(**_kwargs):
+        return {
+            "claim_id": "clm_001",
+            "event_type": "collision",
+            "candidate_track_ids": [21, 100, 118, 112],
+            "keyframes_used": ["data/frame_cache/demo/f_000009.jpg", "data/frame_cache/demo/f_000011.jpg"],
+            "strongest_keyframe": "data/frame_cache/demo/f_000011.jpg",
+            "impact_anchor_track_ids": [21, 118, 100],
+            "impact_anchor_pair_hint": [21, 118],
+            "impact_anchor_pair_score": 0.38,
+            "impact_pair_candidates": [
+                {"pair": [21, 118], "peak_timestamp_sec": 5.5, "peak_score": 0.38, "selection_score": 0.56},
+                {"pair": [100, 118], "peak_timestamp_sec": 6.5, "peak_score": 0.34, "selection_score": 0.43},
+            ],
+            "method": "heuristic_fallback",
+            "primary_track_ids": [21, 118],
+            "secondary_track_ids": [100, 112],
+            "decision_confidence": 0.0,
+            "rationale": "fallback",
+            "ambiguity_flags": [],
+            "grounded_statement": "primary collision statement",
+            "tracking_notes": [],
+        }
+
+    monkeypatch.setattr("src.involvement.resolve_claim_involvement", _fake_resolve)
+
+    result = run_involvement_for_report(
+        report_json_path=report_json,
+        perception_json_path=perception_json,
+        frames_json_path=None,
+        tracks_csv_path=None,
+        out_json_path=out_json,
+        model="gpt-4.1-mini",
+        use_ai=False,
+    )
+    assert result["claims"] == 2
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    claims = payload.get("claims", [])
+    assert isinstance(claims, list) and len(claims) == 2
+    assert claims[0]["claim_id"] == "clm_001"
+    assert claims[1]["claim_id"] == "clm_002"
+    assert claims[1]["primary_track_ids"] == [100, 118]
+
+
+def test_run_involvement_dedupes_duplicate_collision_claims(tmp_path: Path, monkeypatch) -> None:
+    report_json = tmp_path / "report.json"
+    perception_json = tmp_path / "perception.json"
+    out_json = tmp_path / "involvement.json"
+
+    report_json.write_text(
+        json.dumps(
+            {
+                "meta": {"source_video": "data/raw_videos/demo.mp4"},
+                "segments": [
+                    {
+                        "segment_id": "s1",
+                        "claims": [
+                            {
+                                "claim_id": "clm_001",
+                                "event_type": "collision",
+                                "statement": "Collision claim A.",
+                                "support_confidence": 0.95,
+                                "evidence_frames": [9, 10, 11],
+                                "uncertainty_flags": [],
+                            },
+                            {
+                                "claim_id": "clm_002",
+                                "event_type": "collision",
+                                "statement": "Collision claim B.",
+                                "support_confidence": 0.94,
+                                "evidence_frames": [9, 10, 11],
+                                "uncertainty_flags": [],
+                            },
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    perception_json.write_text(
+        json.dumps(
+            [
+                {
+                    "segment_id": "s1",
+                    "start_sec": 4.3,
+                    "end_sec": 8.3,
+                    "keyframes": [
+                        "data/frame_cache/demo/f_000009.jpg",
+                        "data/frame_cache/demo/f_000011.jpg",
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def _fake_resolve(claim: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        claim_id = str(claim.get("claim_id", "")).strip()
+        if claim_id == "clm_001":
+            method = "ai"
+            conf = 0.92
+        else:
+            method = "heuristic_fallback"
+            conf = 0.60
+        return {
+            "claim_id": claim_id,
+            "event_type": "collision",
+            "candidate_track_ids": [21, 100, 118],
+            "keyframes_used": ["data/frame_cache/demo/f_000009.jpg", "data/frame_cache/demo/f_000011.jpg"],
+            "strongest_keyframe": "data/frame_cache/demo/f_000011.jpg",
+            "impact_anchor_track_ids": [21, 118, 100],
+            "impact_anchor_pair_hint": [21, 118],
+            "impact_anchor_pair_score": 0.38,
+            "impact_pair_candidates": [
+                {"pair": [21, 118], "peak_timestamp_sec": 5.5, "peak_score": 0.38, "selection_score": 0.56},
+                {"pair": [100, 118], "peak_timestamp_sec": 6.5, "peak_score": 0.34, "selection_score": 0.43},
+            ],
+            "method": method,
+            "primary_track_ids": [21, 118],
+            "secondary_track_ids": [100],
+            "decision_confidence": conf,
+            "rationale": "resolved",
+            "ambiguity_flags": [],
+            "grounded_statement": "primary collision statement",
+            "tracking_notes": [],
+        }
+
+    monkeypatch.setattr("src.involvement.resolve_claim_involvement", _fake_resolve)
+
+    result = run_involvement_for_report(
+        report_json_path=report_json,
+        perception_json_path=perception_json,
+        frames_json_path=None,
+        tracks_csv_path=None,
+        out_json_path=out_json,
+        model="gpt-4.1-mini",
+        use_ai=True,
+    )
+
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    claims = payload.get("claims", [])
+    assert isinstance(claims, list)
+                                                                          
+    assert len(claims) == 2
+    assert [c["claim_id"] for c in claims] == ["clm_001", "clm_002"]
+    assert claims[0]["primary_track_ids"] == [21, 118]
+    assert claims[1]["primary_track_ids"] == [100, 118]
+    assert result["claims"] == 2

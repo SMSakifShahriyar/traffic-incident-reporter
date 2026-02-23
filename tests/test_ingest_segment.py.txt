@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+import pytest
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.ingest import extract_sampled_frames, probe_video
+from src.segment import compute_frame_energy, propose_candidate_segments, save_segments_csv
+
+
+def test_compute_frame_energy_synthetic_images(tmp_path: Path) -> None:
+    img_prev = np.zeros((32, 32), dtype=np.uint8)
+    img_curr = np.full((32, 32), 255, dtype=np.uint8)
+
+    prev_path = tmp_path / "prev.jpg"
+    curr_path = tmp_path / "curr.jpg"
+
+    assert cv2.imwrite(str(prev_path), img_prev)
+    assert cv2.imwrite(str(curr_path), img_curr)
+
+    energy = compute_frame_energy(prev_path, curr_path)
+    assert 200.0 <= energy <= 255.0
+
+
+def test_propose_candidate_segments_constraints() -> None:
+    energy_series = [
+        {"frame_id": 0, "time_sec": 0.0, "energy": 0.0},
+        {"frame_id": 1, "time_sec": 1.0, "energy": 0.1},
+        {"frame_id": 2, "time_sec": 2.0, "energy": 0.15},
+        {"frame_id": 3, "time_sec": 3.0, "energy": 0.95},
+        {"frame_id": 4, "time_sec": 4.0, "energy": 0.92},
+        {"frame_id": 5, "time_sec": 5.0, "energy": 0.2},
+        {"frame_id": 6, "time_sec": 6.0, "energy": 0.1},
+        {"frame_id": 7, "time_sec": 7.0, "energy": 0.9},
+        {"frame_id": 8, "time_sec": 8.0, "energy": 0.89},
+        {"frame_id": 9, "time_sec": 9.0, "energy": 0.2},
+        {"frame_id": 10, "time_sec": 10.0, "energy": 0.15},
+        {"frame_id": 11, "time_sec": 11.0, "energy": 0.05},
+    ]
+
+    min_sec = 2.0
+    max_sec = 4.0
+    segments = propose_candidate_segments(
+        energy_series=energy_series,
+        min_segment_sec=min_sec,
+        max_segment_sec=max_sec,
+        threshold_quantile=0.8,
+        merge_gap_sec=0.5,
+        max_segments=3,
+    )
+
+    assert segments
+    assert len(segments) <= 3
+
+    last_end = -1.0
+    for segment in segments:
+        start = float(segment["start_sec"])
+        end = float(segment["end_sec"])
+        duration = end - start
+
+        assert start < end
+        assert start >= last_end
+        assert duration >= min_sec
+        assert duration <= max_sec
+
+        last_end = end
+
+
+def test_short_clip_adds_late_window_candidate() -> None:
+    energy_series = [
+        {"frame_id": 0, "time_sec": 0.0, "energy": 0.0},
+        {"frame_id": 1, "time_sec": 1.0, "energy": 0.95},
+        {"frame_id": 2, "time_sec": 2.0, "energy": 0.92},
+        {"frame_id": 3, "time_sec": 3.0, "energy": 0.2},
+        {"frame_id": 4, "time_sec": 4.0, "energy": 0.1},
+        {"frame_id": 5, "time_sec": 5.0, "energy": 0.05},
+        {"frame_id": 6, "time_sec": 6.0, "energy": 0.05},
+        {"frame_id": 7, "time_sec": 7.0, "energy": 0.05},
+        {"frame_id": 8, "time_sec": 8.0, "energy": 0.05},
+        {"frame_id": 9, "time_sec": 9.0, "energy": 0.05},
+        {"frame_id": 10, "time_sec": 10.0, "energy": 0.05},
+    ]
+
+    segments = propose_candidate_segments(
+        energy_series=energy_series,
+        min_segment_sec=2.0,
+        max_segment_sec=4.0,
+        threshold_quantile=0.95,
+        merge_gap_sec=0.2,
+        max_segments=3,
+    )
+
+    late_start = max(0.0, 10.0 - 4.0)
+    late_end = 10.0
+    assert any(
+        max(float(seg["start_sec"]), late_start) < min(float(seg["end_sec"]), late_end) for seg in segments
+    )
+
+
+def test_short_clip_injects_mid_window_when_missing_focus_overlap() -> None:
+    energy_series = [
+        {"frame_id": 0, "time_sec": 0.0, "energy": 0.0},
+        {"frame_id": 1, "time_sec": 1.0, "energy": 0.95},
+        {"frame_id": 2, "time_sec": 2.0, "energy": 0.92},
+        {"frame_id": 3, "time_sec": 3.0, "energy": 0.2},
+        {"frame_id": 4, "time_sec": 4.0, "energy": 0.1},
+        {"frame_id": 5, "time_sec": 5.0, "energy": 0.09},
+        {"frame_id": 6, "time_sec": 6.0, "energy": 0.08},
+        {"frame_id": 7, "time_sec": 7.0, "energy": 0.07},
+        {"frame_id": 8, "time_sec": 8.0, "energy": 0.06},
+        {"frame_id": 9, "time_sec": 9.0, "energy": 0.05},
+        {"frame_id": 10, "time_sec": 10.0, "energy": 0.05},
+    ]
+
+    segments = propose_candidate_segments(
+        energy_series=energy_series,
+        min_segment_sec=2.0,
+        max_segment_sec=4.0,
+        threshold_quantile=0.95,
+        merge_gap_sec=0.2,
+        max_segments=3,
+    )
+
+    focus_start = 10.0 * 0.45
+    focus_end = 10.0 * 0.75
+    assert any(
+        max(float(seg["start_sec"]), focus_start) < min(float(seg["end_sec"]), focus_end) for seg in segments
+    )
+
+
+def test_fallback_full_clip_if_no_focus_overlap() -> None:
+    energy_series = [
+        {"frame_id": 0, "time_sec": 0.0, "energy": 0.0},
+        {"frame_id": 1, "time_sec": 1.0, "energy": 0.9},
+        {"frame_id": 2, "time_sec": 2.0, "energy": 0.85},
+        {"frame_id": 3, "time_sec": 3.0, "energy": 0.1},
+        {"frame_id": 4, "time_sec": 4.0, "energy": 0.05},
+        {"frame_id": 5, "time_sec": 5.0, "energy": 0.05},
+        {"frame_id": 6, "time_sec": 6.0, "energy": 0.05},
+        {"frame_id": 7, "time_sec": 7.0, "energy": 0.05},
+        {"frame_id": 8, "time_sec": 8.0, "energy": 0.05},
+        {"frame_id": 9, "time_sec": 9.0, "energy": 0.05},
+        {"frame_id": 10, "time_sec": 10.0, "energy": 0.05},
+        {"frame_id": 11, "time_sec": 11.0, "energy": 0.05},
+        {"frame_id": 12, "time_sec": 12.0, "energy": 0.05},
+        {"frame_id": 13, "time_sec": 13.0, "energy": 0.05},
+        {"frame_id": 14, "time_sec": 14.0, "energy": 0.05},
+        {"frame_id": 15, "time_sec": 15.0, "energy": 0.05},
+        {"frame_id": 16, "time_sec": 16.0, "energy": 0.05},
+        {"frame_id": 17, "time_sec": 17.0, "energy": 0.05},
+        {"frame_id": 18, "time_sec": 18.0, "energy": 0.05},
+        {"frame_id": 19, "time_sec": 19.0, "energy": 0.05},
+        {"frame_id": 20, "time_sec": 20.0, "energy": 0.05},
+    ]
+
+    segments = propose_candidate_segments(
+        energy_series=energy_series,
+        min_segment_sec=2.0,
+        max_segment_sec=8.0,
+        threshold_quantile=1.0,
+        merge_gap_sec=0.5,
+        max_segments=3,
+    )
+
+    assert len(segments) == 1
+    assert segments[0]["trigger"] == "fallback_full_clip"
+    assert float(segments[0]["start_sec"]) == 0.0
+    assert float(segments[0]["end_sec"]) == 20.0
+
+
+def test_save_segments_csv_includes_peak_energy(tmp_path: Path) -> None:
+    out_csv = tmp_path / "segments.csv"
+    segments = [
+        {
+            "segment_id": "s1",
+            "start_sec": 1.0,
+            "end_sec": 3.0,
+            "trigger": "motion_energy",
+            "peak_energy": 12.5,
+        }
+    ]
+
+    save_segments_csv(segments, out_csv)
+    csv_text = out_csv.read_text(encoding="utf-8")
+    assert "peak_energy" in csv_text.splitlines()[0]
+    assert "12.5" in csv_text
+
+
+@pytest.mark.skipif(
+    not (PROJECT_ROOT / "data" / "raw_videos" / "demo.mp4").exists(),
+    reason="Optional integration test requires data/raw_videos/demo.mp4",
+)
+def test_optional_ingest_integration(tmp_path: Path) -> None:
+    video_path = PROJECT_ROOT / "data" / "raw_videos" / "demo.mp4"
+    out_dir = tmp_path / "frames"
+
+    meta = probe_video(video_path)
+    frames = extract_sampled_frames(video_path=video_path, out_dir=out_dir, sample_fps=1.0, short_side_resize=320)
+
+    assert meta["fps"] > 0
+    assert len(frames) > 0
+    assert (out_dir / "f_000000.jpg").exists()

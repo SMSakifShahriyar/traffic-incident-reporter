@@ -1,0 +1,444 @@
+from __future__ import annotations
+
+import csv
+import json
+import os
+import platform
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any
+
+
+DEFAULT_CLASS_WHITELIST = ["person", "bicycle", "car", "motorcycle", "bus", "truck"]
+
+
+def resolve_model_name(preferred: str | None) -> str:
+
+    if preferred and str(preferred).strip():
+        return str(preferred).strip()
+    return "yolo11n.pt"
+
+
+def _load_model_with_fallback(model_name: str | None) -> tuple[Any, str]:
+    try:
+        from ultralytics import YOLO
+    except Exception as exc:                                                   
+        raise ImportError(
+            "Ultralytics is not available. Install dependencies with `pip install -r requirements.txt`."
+        ) from exc
+
+    if model_name and str(model_name).strip():
+        chosen = str(model_name).strip()
+        return (YOLO(chosen), chosen)
+
+    candidates = ["yolo11n.pt", "yolov8n.pt"]
+    last_error: Exception | None = None
+    for candidate in candidates:
+        try:
+            return (YOLO(candidate), candidate)
+        except Exception as exc:                                                   
+            last_error = exc
+    raise RuntimeError(f"Unable to load default models {candidates}: {last_error}")
+
+
+def _model_name_map(model: Any) -> dict[int, str]:
+    names = getattr(model, "names", {})
+    if isinstance(names, dict):
+        return {int(idx): str(name) for idx, name in names.items()}
+    if isinstance(names, list):
+        return {idx: str(name) for idx, name in enumerate(names)}
+    raise ValueError("Unable to read class names from model")
+
+
+def _class_indices_from_whitelist(name_map: dict[int, str], classes: list[str]) -> list[int]:
+    wanted = {cls.strip().lower() for cls in classes if cls.strip()}
+    indices = [idx for idx, name in name_map.items() if name.lower() in wanted]
+    if not indices:
+        raise ValueError(f"No matching classes found in model for whitelist: {sorted(wanted)}")
+    return sorted(indices)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _codec_candidates_for_platform() -> list[str]:
+
+    override = os.getenv("TIR_ANNOTATED_CODECS", "").strip()
+    if override:
+        parsed = [item.strip() for item in override.split(",") if item.strip()]
+        if parsed:
+            return parsed
+
+    if platform.system().lower().startswith("win"):
+        return ["mp4v", "avc1", "H264"]
+    return ["avc1", "H264", "mp4v"]
+
+
+def _annotated_targets_for_platform() -> list[tuple[str, str]]:
+
+    targets: list[tuple[str, str]] = []
+    for codec in _codec_candidates_for_platform():
+        upper = codec.upper()
+        if upper in {"VP80", "VP90"}:
+            suffix = ".webm"
+        elif upper in {"MJPG", "XVID"}:
+            suffix = ".avi"
+        else:
+            suffix = ".mp4"
+        targets.append((suffix, codec))
+
+                                                                    
+    if platform.system().lower().startswith("win"):
+        preferred = [(".mp4", "mp4v"), (".mp4", "avc1"), (".avi", "MJPG")]
+        merged: list[tuple[str, str]] = []
+        seen_pref: set[tuple[str, str]] = set()
+        for item in preferred + targets:
+            if item in seen_pref:
+                continue
+            seen_pref.add(item)
+            merged.append(item)
+        targets = merged
+
+    deduped: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in targets:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def run_detect_track(
+    video_path: str,
+    out_dir: str,
+    model_name: str | None = None,
+    tracker: str = "botsort.yaml",
+    conf: float = 0.25,
+    iou: float = 0.5,
+    classes: list[str] | None = None,
+    save_annotated: bool = True,
+) -> dict[str, Any]:
+
+    import cv2
+
+    video = Path(video_path)
+    if not video.exists() or not video.is_file():
+        raise FileNotFoundError(f"Video not found: {video}")
+
+    output_dir = Path(out_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model, chosen_model = _load_model_with_fallback(resolve_model_name(model_name))
+    name_map = _model_name_map(model)
+
+    class_whitelist = classes[:] if classes else DEFAULT_CLASS_WHITELIST[:]
+    class_indices = _class_indices_from_whitelist(name_map, class_whitelist)
+    classes_used = [name_map[idx] for idx in class_indices]
+
+    capture = cv2.VideoCapture(str(video))
+    if not capture.isOpened():
+        raise ValueError(f"Unable to open video: {video}")
+
+    fps = _safe_float(capture.get(cv2.CAP_PROP_FPS), 0.0)
+    num_frames = _safe_int(capture.get(cv2.CAP_PROP_FRAME_COUNT), 0)
+    width = _safe_int(capture.get(cv2.CAP_PROP_FRAME_WIDTH), 0)
+    height = _safe_int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT), 0)
+    capture.release()
+
+    if fps <= 0:
+        raise ValueError(f"Invalid FPS detected for video: {video}")
+
+    stem = video.stem
+    tracks_csv_path = output_dir / f"{stem}_tracks.csv"
+    summary_json_path = output_dir / f"{stem}_tracks_summary.json"
+    annotated_base = output_dir / f"{stem}_annotated"
+    annotated_path: Path | None = None
+
+    writer: Any | None = None
+    writer_codec: str | None = None
+    writer_suffix: str | None = None
+
+    def _init_writer(frame_width: int, frame_height: int) -> None:
+        nonlocal writer, annotated_path, writer_codec, writer_suffix
+        if not save_annotated or writer is not None:
+            return
+
+        frame_size = (max(1, int(frame_width)), max(1, int(frame_height)))
+        target_candidates = _annotated_targets_for_platform()
+        for suffix, codec in target_candidates:
+            candidate_path = annotated_base.with_suffix(suffix)
+            if candidate_path.exists():
+                try:
+                    candidate_path.unlink()
+                except Exception:
+                    pass
+            maybe_writer = cv2.VideoWriter(
+                str(candidate_path),
+                cv2.VideoWriter_fourcc(*codec),
+                fps,
+                frame_size,
+            )
+            if maybe_writer.isOpened():
+                writer = maybe_writer
+                writer_codec = codec
+                writer_suffix = suffix
+                annotated_path = candidate_path
+                return
+            maybe_writer.release()
+
+        annotated_path = None
+
+    rows: list[dict[str, Any]] = []
+    skipped_without_id = 0
+
+    results = model.track(
+        source=str(video),
+        stream=True,
+        persist=True,
+        tracker=tracker,
+        conf=float(conf),
+        iou=float(iou),
+        classes=class_indices,
+        verbose=False,
+    )
+
+    for frame_idx, result in enumerate(results):
+        frame = getattr(result, "orig_img", None)
+        if frame is not None and save_annotated:
+            frame_height, frame_width = frame.shape[:2]
+            _init_writer(frame_width=frame_width, frame_height=frame_height)
+
+        boxes = getattr(result, "boxes", None)
+        if boxes is None:
+            if writer is not None and frame is not None:
+                writer.write(frame)
+            continue
+
+        try:
+            xyxy = boxes.xyxy.cpu().numpy()
+            confs = boxes.conf.cpu().numpy()
+            class_ids = boxes.cls.cpu().numpy()
+            track_ids = boxes.id.cpu().numpy() if boxes.id is not None else None
+        except Exception:
+            if writer is not None and frame is not None:
+                writer.write(frame)
+            continue
+
+        for idx in range(len(xyxy)):
+            if track_ids is None:
+                skipped_without_id += 1
+                continue
+
+            track_id = _safe_int(track_ids[idx], -1)
+            if track_id < 0:
+                skipped_without_id += 1
+                continue
+
+            class_id = _safe_int(class_ids[idx], -1)
+            class_name = name_map.get(class_id, "unknown")
+            confidence = _safe_float(confs[idx], 0.0)
+            x1, y1, x2, y2 = [float(v) for v in xyxy[idx].tolist()]
+            timestamp_sec = frame_idx / fps
+
+            rows.append(
+                {
+                    "frame_idx": frame_idx,
+                    "timestamp_sec": round(timestamp_sec, 6),
+                    "track_id": track_id,
+                    "class_id": class_id,
+                    "class_name": class_name,
+                    "conf": round(confidence, 6),
+                    "x1": round(x1, 3),
+                    "y1": round(y1, 3),
+                    "x2": round(x2, 3),
+                    "y2": round(y2, 3),
+                    "frame_width": int(frame.shape[1]) if frame is not None else width,
+                    "frame_height": int(frame.shape[0]) if frame is not None else height,
+                }
+            )
+
+            if writer is not None and frame is not None:
+                pt1 = (int(max(0.0, x1)), int(max(0.0, y1)))
+                pt2 = (int(max(0.0, x2)), int(max(0.0, y2)))
+                cv2.rectangle(frame, pt1, pt2, (0, 215, 255), 2)
+                label = f"{class_name} #{track_id} {confidence:.2f}"
+                cv2.putText(
+                    frame,
+                    label,
+                    (pt1[0], max(0, pt1[1] - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 215, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+        if writer is not None and frame is not None:
+            writer.write(frame)
+
+    if writer is not None:
+        writer.release()
+
+    fieldnames = [
+        "frame_idx",
+        "timestamp_sec",
+        "track_id",
+        "class_id",
+        "class_name",
+        "conf",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "frame_width",
+        "frame_height",
+    ]
+    with tracks_csv_path.open("w", encoding="utf-8", newline="") as fp:
+        writer_csv = csv.DictWriter(fp, fieldnames=fieldnames)
+        writer_csv.writeheader()
+        for row in rows:
+            writer_csv.writerow(row)
+
+    class_counts = dict(sorted(Counter(str(row["class_name"]) for row in rows).items()))
+
+    per_track_rows: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        per_track_rows[int(row["track_id"])].append(row)
+
+    tracks_summary: list[dict[str, Any]] = []
+    for track_id, track_rows in sorted(per_track_rows.items(), key=lambda item: item[0]):
+        classes_for_track = [str(item["class_name"]) for item in track_rows]
+        class_name = Counter(classes_for_track).most_common(1)[0][0] if classes_for_track else "unknown"
+        first_sec = min(float(item["timestamp_sec"]) for item in track_rows)
+        last_sec = max(float(item["timestamp_sec"]) for item in track_rows)
+        mean_conf = sum(float(item["conf"]) for item in track_rows) / max(1, len(track_rows))
+        tracks_summary.append(
+            {
+                "track_id": int(track_id),
+                "class_name": class_name,
+                "first_sec": round(first_sec, 6),
+                "last_sec": round(last_sec, 6),
+                "mean_conf": round(mean_conf, 6),
+                "num_boxes": len(track_rows),
+            }
+        )
+
+    payload = {
+        "video": str(video),
+        "model": chosen_model,
+        "tracker": tracker,
+        "fps": fps,
+        "frame_width": width,
+        "frame_height": height,
+        "num_frames": num_frames,
+        "num_detections": len(rows),
+        "skipped_without_track_id": skipped_without_id,
+        "classes_used": classes_used,
+        "annotated_codec": writer_codec if annotated_path is not None else None,
+        "annotated_ext": writer_suffix if annotated_path is not None else None,
+        "tracks": tracks_summary,
+        "class_counts": class_counts,
+    }
+    summary_json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    return {
+        "tracks_csv": str(tracks_csv_path),
+        "summary_json": str(summary_json_path),
+        "annotated_video": str(annotated_path) if annotated_path is not None else None,
+        "num_tracks": len(tracks_summary),
+        "num_detections": len(rows),
+    }
+
+
+def summarize_tracks_for_segment(
+    tracks_csv_path: str,
+    start_sec: float,
+    end_sec: float,
+) -> dict[str, Any]:
+
+    import pandas as pd
+
+    csv_path = Path(tracks_csv_path)
+    if not csv_path.exists() or not csv_path.is_file():
+        raise FileNotFoundError(f"Tracks CSV not found: {csv_path}")
+
+    if end_sec < start_sec:
+        start_sec, end_sec = end_sec, start_sec
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        return {
+            "start_sec": float(start_sec),
+            "end_sec": float(end_sec),
+            "class_counts": {},
+            "unique_track_ids": 0,
+            "tracks": [],
+        }
+
+    window = df[(df["timestamp_sec"] >= float(start_sec)) & (df["timestamp_sec"] <= float(end_sec))]
+    if window.empty:
+        return {
+            "start_sec": float(start_sec),
+            "end_sec": float(end_sec),
+            "class_counts": {},
+            "unique_track_ids": 0,
+            "tracks": [],
+        }
+
+    class_counts_series = window["class_name"].value_counts()
+    class_counts = {str(idx): int(val) for idx, val in class_counts_series.items()}
+
+    grouped = (
+        window.groupby(["track_id", "class_name"])
+        .size()
+        .reset_index(name="num_boxes")
+        .sort_values(by=["num_boxes", "track_id"], ascending=[False, True])
+    )
+    tracks: list[dict[str, Any]] = []
+    for row in grouped.itertuples(index=False):
+        tracks.append(
+            {
+                "track_id": int(row.track_id),
+                "class_name": str(row.class_name),
+                "num_boxes": int(row.num_boxes),
+            }
+        )
+
+    unique_track_ids = int(window["track_id"].nunique())
+    return {
+        "start_sec": float(start_sec),
+        "end_sec": float(end_sec),
+        "class_counts": class_counts,
+        "unique_track_ids": unique_track_ids,
+        "tracks": tracks,
+    }
+
+
+def assign_actor_roles_from_tracks(track_class_name: str) -> str:
+
+    name = str(track_class_name).strip().lower()
+    if name == "person":
+        return "pedestrian"
+    if name == "bicycle":
+        return "bicycle"
+    if name == "motorcycle":
+        return "motorcycle"
+    if name == "car":
+        return "car"
+    if name == "bus":
+        return "bus"
+    if name == "truck":
+        return "truck"
+    return "unknown"

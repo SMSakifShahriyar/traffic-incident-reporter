@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from pydantic import ValidationError
+
+from .schema import IncidentReport
+
+
+def load_report(path: str | Path) -> IncidentReport:
+    report_path = Path(path)
+    raw_json = report_path.read_text(encoding="utf-8")
+    return IncidentReport.model_validate_json(raw_json)
+
+
+def validate_report(path: str | Path) -> None:
+    try:
+        load_report(path)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid incident report at {path}:\n{exc}") from exc
+    print("VALID")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Incident report utilities")
+    parser.add_argument("--validate", type=Path, help="Path to JSON report to validate")
+    args = parser.parse_args()
+
+    if args.validate:
+        validate_report(args.validate)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

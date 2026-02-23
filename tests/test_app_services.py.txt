@@ -1,0 +1,1081 @@
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src import app_services
+
+
+def test_ensure_dirs_creates_required_folders(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    app_services.ensure_dirs()
+
+    assert (tmp_path / "data" / "raw_videos").exists()
+    assert (tmp_path / "data" / "frame_cache").exists()
+    assert (tmp_path / "data" / "outputs").exists()
+    assert (tmp_path / "data" / "outputs" / "reports").exists()
+    assert (tmp_path / "data" / "outputs" / "reports" / "reviewed").exists()
+
+
+def test_should_reuse_perception_true_and_false(tmp_path: Path) -> None:
+    perception_json = tmp_path / "demo_perception.json"
+    perception_json.write_text("[]", encoding="utf-8")
+    meta_path = Path(f"{perception_json}.meta.json")
+
+    video_path = tmp_path / "demo.mp4"
+    video_path.write_bytes(b"fake")
+    segments_csv = tmp_path / "demo_segments.csv"
+    segments_csv.write_text("segment_id,start_sec,end_sec\ns1,0,2\n", encoding="utf-8")
+
+    matching_meta = {
+        "video_path": str(video_path.resolve()),
+        "segments_csv": str(segments_csv.resolve()),
+        "model": "gpt-4.1-mini",
+        "max_frames": 4,
+    }
+    meta_path.write_text(json.dumps(matching_meta), encoding="utf-8")
+
+    assert app_services.should_reuse_perception(
+        perception_json=perception_json,
+        video_path=video_path,
+        segments_csv=segments_csv,
+        model="gpt-4.1-mini",
+        max_frames=4,
+    )
+
+    assert not app_services.should_reuse_perception(
+        perception_json=perception_json,
+        video_path=video_path,
+        segments_csv=segments_csv,
+        model="gpt-4.1-mini",
+        max_frames=5,
+    )
+
+
+def test_extract_summary_expected_keys() -> None:
+    report_json = {
+        "overall_assessment": {
+            "event_type": "near_miss",
+            "severity": "low",
+            "review_required": True,
+            "summary": "Near miss observed.",
+            "uncertainty_flags": ["actor_type_ambiguous"],
+        },
+        "segments": [
+            {
+                "segment_id": "s1",
+                "start_sec": 0.0,
+                "end_sec": 2.0,
+                "segment_confidence": 0.8,
+                "evidence_frames": [1],
+                "claims": [{"claim_id": "c1"}, {"claim_id": "c2"}],
+                "uncertainty_flags": [],
+            }
+        ],
+    }
+
+    summary = app_services.extract_summary(report_json)
+    assert set(summary.keys()) == {
+        "event_type",
+        "severity",
+        "review_required",
+        "claims_count",
+        "uncertainty_flags",
+    }
+    assert summary["event_type"] == "near_miss"
+    assert summary["claims_count"] == 2
+
+
+def test_save_reviewed_copy_creates_new_and_preserves_original(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    app_services.ensure_dirs()
+
+    report_path = tmp_path / "data" / "outputs" / "reports" / "demo_s1_collision_report.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    original_report = {
+        "meta": {
+            "report_id": "demo_s1_collision",
+            "source_video": "data/raw_videos/demo.mp4",
+            "created_at": "2026-01-01T00:00:00Z",
+            "schema_version": "1.0",
+        },
+        "actors": [{"actor_id": "a1", "role": "car", "description": "Sedan"}],
+        "segments": [
+            {
+                "segment_id": "s1",
+                "start_sec": 1.0,
+                "end_sec": 3.0,
+                "segment_confidence": 0.9,
+                "evidence_frames": [12],
+                "claims": [
+                    {
+                        "claim_id": "clm_001",
+                        "event_type": "collision",
+                        "severity": "medium",
+                        "statement": "Collision observed.",
+                        "support_confidence": 0.9,
+                        "evidence_frames": [12],
+                        "uncertainty_flags": [],
+                    }
+                ],
+                "uncertainty_flags": [],
+            }
+        ],
+        "overall_assessment": {
+            "event_type": "collision",
+            "severity": "medium",
+            "review_required": True,
+            "summary": "Collision observed.",
+            "uncertainty_flags": [],
+        },
+        "audit": {
+            "validator_version": "v1",
+            "review_required": True,
+            "uncertainty_flags": [],
+            "notes": "model_name=gpt-4.1-mini",
+        },
+    }
+    report_path.write_text(json.dumps(original_report, indent=2), encoding="utf-8")
+
+    reviewed_path = app_services.save_reviewed_copy(
+        report_path=report_path,
+        override_event_type="near_miss",
+        override_severity="low",
+        reviewer_note="manual review complete",
+    )
+
+    reviewed_file = Path(reviewed_path)
+    assert reviewed_file.exists()
+    assert "reviewed" in reviewed_file.parts
+
+    original_after = json.loads(report_path.read_text(encoding="utf-8"))
+    assert original_after["overall_assessment"]["event_type"] == "collision"
+    reviewed_after = json.loads(reviewed_file.read_text(encoding="utf-8"))
+    assert reviewed_after["overall_assessment"]["event_type"] == "near_miss"
+    assert reviewed_after["overall_assessment"]["severity"] == "low"
+    assert "manual review complete" in reviewed_after["audit"]["notes"]
+
+
+def test_apply_grounded_claims_to_report_updates_statement(tmp_path: Path) -> None:
+    report_path = tmp_path / "report.json"
+    involvement_path = tmp_path / "involvement.json"
+
+    report_path.write_text(
+        json.dumps(
+            {
+                "meta": {
+                    "report_id": "demo_s1_collision",
+                    "source_video": "data/raw_videos/demo.mp4",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "schema_version": "1.0",
+                },
+                "actors": [{"actor_id": "a1", "role": "car", "description": "car"}],
+                "segments": [
+                    {
+                        "segment_id": "s1",
+                        "start_sec": 4.3,
+                        "end_sec": 8.3,
+                        "segment_confidence": 0.9,
+                        "evidence_frames": [9],
+                        "claims": [
+                            {
+                                "claim_id": "clm_001",
+                                "event_type": "collision",
+                                "severity": "medium",
+                                "statement": "Old statement.",
+                                "support_confidence": 0.95,
+                                "evidence_frames": [9],
+                                "uncertainty_flags": [],
+                            }
+                        ],
+                        "uncertainty_flags": [],
+                    }
+                ],
+                "overall_assessment": {
+                    "event_type": "collision",
+                    "severity": "medium",
+                    "review_required": True,
+                    "summary": "Collision.",
+                    "uncertainty_flags": [],
+                },
+                "audit": {
+                    "validator_version": "v1",
+                    "review_required": True,
+                    "uncertainty_flags": [],
+                    "notes": "",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    involvement_path.write_text(
+        json.dumps(
+            {
+                "segment_id": "s1",
+                "claims": [
+                    {
+                        "claim_id": "clm_001",
+                        "grounded_statement": (
+                            "Between 4.30s and 8.30s, track 21 (car) and track 118 (car) show the strongest "
+                            "collision interaction near 5.50s."
+                        ),
+                        "ambiguity_flags": ["possible_id_switch"],
+                        "primary_track_ids": [21, 118],
+                        "secondary_track_ids": [100],
+                    },
+                    {
+                        "claim_id": "clm_002",
+                        "event_type": "collision",
+                        "grounded_statement": (
+                            "Between 4.30s and 8.30s, a second collision interaction is observed near 6.50s "
+                            "between track 100 and track 118."
+                        ),
+                        "derived_support_confidence": 0.78,
+                        "primary_track_ids": [100, 118],
+                        "secondary_track_ids": [],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = app_services.apply_grounded_claims_to_report(report_path, involvement_path)
+    assert result["updated_claims"] == 2
+
+    updated = json.loads(report_path.read_text(encoding="utf-8"))
+    claim = updated["segments"][0]["claims"][0]
+    assert "track 21 (car)" in claim["statement"]
+    assert "possible_id_switch" in claim["uncertainty_flags"]
+    assert "statement_grounding=involvement_v1" in str(updated["audit"].get("notes", ""))
+    assert len(updated["segments"][0]["claims"]) == 2
+    assert updated["segments"][0]["claims"][1]["claim_id"] == "clm_002"
+
+
+def test_apply_grounded_claims_removes_stale_duplicate_claims(tmp_path: Path) -> None:
+    report_path = tmp_path / "report_dup.json"
+    involvement_path = tmp_path / "involvement_dup.json"
+
+    report_path.write_text(
+        json.dumps(
+            {
+                "meta": {
+                    "report_id": "demo_s2_collision",
+                    "source_video": "data/raw_videos/demo.mp4",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "schema_version": "1.0",
+                },
+                "actors": [{"actor_id": "a1", "role": "car", "description": "car"}],
+                "segments": [
+                    {
+                        "segment_id": "s2",
+                        "start_sec": 4.3,
+                        "end_sec": 8.3,
+                        "segment_confidence": 0.9,
+                        "evidence_frames": [9],
+                        "claims": [
+                            {
+                                "claim_id": "clm_001",
+                                "event_type": "collision",
+                                "severity": "medium",
+                                "statement": "old A",
+                                "support_confidence": 0.95,
+                                "evidence_frames": [9],
+                                "uncertainty_flags": [],
+                            },
+                            {
+                                "claim_id": "clm_002",
+                                "event_type": "collision",
+                                "severity": "medium",
+                                "statement": "old B",
+                                "support_confidence": 0.95,
+                                "evidence_frames": [9],
+                                "uncertainty_flags": [],
+                            },
+                            {
+                                "claim_id": "clm_003",
+                                "event_type": "collision",
+                                "severity": "medium",
+                                "statement": "old derived duplicate",
+                                "support_confidence": 0.7,
+                                "evidence_frames": [9],
+                                "uncertainty_flags": [],
+                            },
+                            {
+                                "claim_id": "clm_004",
+                                "event_type": "collision",
+                                "severity": "medium",
+                                "statement": "old derived duplicate",
+                                "support_confidence": 0.7,
+                                "evidence_frames": [9],
+                                "uncertainty_flags": [],
+                            },
+                        ],
+                        "uncertainty_flags": [],
+                    }
+                ],
+                "overall_assessment": {
+                    "event_type": "collision",
+                    "severity": "medium",
+                    "review_required": True,
+                    "summary": "Collision.",
+                    "uncertainty_flags": [],
+                },
+                "audit": {
+                    "validator_version": "v1",
+                    "review_required": True,
+                    "uncertainty_flags": [],
+                    "notes": "",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    involvement_path.write_text(
+        json.dumps(
+            {
+                "segment_id": "s2",
+                "claims": [
+                    {
+                        "claim_id": "clm_001",
+                        "event_type": "collision",
+                        "grounded_statement": "primary interaction near 5.50s between track 21 and 118",
+                        "primary_track_ids": [21, 118],
+                        "secondary_track_ids": [100],
+                        "decision_confidence": 0.9,
+                        "ambiguity_flags": [],
+                        "impact_pair_candidates": [
+                            {"pair": [21, 118], "peak_timestamp_sec": 5.5, "selection_score": 0.55}
+                        ],
+                        "method": "ai",
+                    },
+                    {
+                        "claim_id": "clm_002",
+                        "event_type": "collision",
+                        "grounded_statement": "secondary interaction near 6.50s between track 100 and 118",
+                        "primary_track_ids": [100, 118],
+                        "secondary_track_ids": [],
+                        "decision_confidence": 0.78,
+                        "ambiguity_flags": [],
+                        "impact_pair_candidates": [
+                            {"pair": [100, 118], "peak_timestamp_sec": 6.5, "selection_score": 0.41}
+                        ],
+                        "method": "derived_secondary",
+                    },
+                    {
+                        "claim_id": "clm_003",
+                        "event_type": "collision",
+                        "grounded_statement": "secondary interaction near 6.50s between track 100 and 118",
+                        "primary_track_ids": [100, 118],
+                        "secondary_track_ids": [],
+                        "decision_confidence": 0.50,
+                        "ambiguity_flags": [],
+                        "impact_pair_candidates": [
+                            {"pair": [100, 118], "peak_timestamp_sec": 6.5, "selection_score": 0.41}
+                        ],
+                        "method": "heuristic_fallback",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = app_services.apply_grounded_claims_to_report(report_path, involvement_path)
+    assert result["segment_mismatch"] is False
+
+    updated = json.loads(report_path.read_text(encoding="utf-8"))
+    claims = updated["segments"][0]["claims"]
+    assert len(claims) == 2
+    assert [claim["claim_id"] for claim in claims] == ["clm_001", "clm_002"]
+    assert len({claim["statement"] for claim in claims}) == 2
+
+def test_render_annotated_keyframe_creates_output(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    app_services.ensure_dirs()
+
+    src_image = tmp_path / "source.jpg"
+    img = np.full((80, 120, 3), 180, dtype=np.uint8)
+    assert cv2.imwrite(str(src_image), img)
+
+    rendered = app_services.render_annotated_keyframe(
+        image_path=str(src_image),
+        output_path="ignored.jpg",
+        overlay_lines=["t=1.20s", "segment=s1", "claim=clm_001", "event=near_miss"],
+    )
+    assert Path(rendered).exists()
+
+
+def test_render_annotated_keyframe_cache_reuse(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    app_services.ensure_dirs()
+
+    src_image = tmp_path / "source_cache.jpg"
+    img = np.full((70, 110, 3), 120, dtype=np.uint8)
+    assert cv2.imwrite(str(src_image), img)
+
+    first = app_services.render_annotated_keyframe(
+        image_path=str(src_image),
+        output_path="ignored.jpg",
+        overlay_lines=["t=2.00s", "segment=s2"],
+    )
+    first_path = Path(first)
+    first_mtime = first_path.stat().st_mtime_ns
+
+    second = app_services.render_annotated_keyframe(
+        image_path=str(src_image),
+        output_path="ignored.jpg",
+        overlay_lines=["t=2.00s", "segment=s2"],
+    )
+    second_path = Path(second)
+    second_mtime = second_path.stat().st_mtime_ns
+
+    assert first == second
+    assert first_mtime == second_mtime
+
+
+def test_render_annotated_keyframe_cache_invalidates_when_source_changes(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    app_services.ensure_dirs()
+
+    src_image = tmp_path / "source_update.jpg"
+    img1 = np.full((70, 110, 3), 120, dtype=np.uint8)
+    assert cv2.imwrite(str(src_image), img1)
+
+    first = app_services.render_annotated_keyframe(
+        image_path=str(src_image),
+        output_path="ignored.jpg",
+        overlay_lines=["t=2.00s", "segment=s2"],
+    )
+
+                                                                      
+    img2 = np.full((70, 110, 3), 150, dtype=np.uint8)
+    assert cv2.imwrite(str(src_image), img2)
+
+    second = app_services.render_annotated_keyframe(
+        image_path=str(src_image),
+        output_path="ignored.jpg",
+        overlay_lines=["t=2.00s", "segment=s2"],
+    )
+
+    assert first != second
+
+
+def test_frame_to_seconds_fallback_logic() -> None:
+    assert abs(app_services.frame_to_seconds(10, fps=5.0, fallback_fps=2.0) - 2.0) < 1e-9
+    assert abs(app_services.frame_to_seconds(10, fps=None, fallback_fps=2.0) - 5.0) < 1e-9
+    assert abs(app_services.frame_to_seconds(10, fps=0.0, fallback_fps=4.0) - 2.5) < 1e-9
+
+
+def test_claim_filter_to_keyframes_mapping() -> None:
+    claim = {"claim_id": "clm_001", "evidence_frames": [2, 5]}
+    keyframes = [
+        "data/frame_cache/demo/f_000001.jpg",
+        "data/frame_cache/demo/f_000002.jpg",
+        "data/frame_cache/demo/f_000005.jpg",
+        "data/frame_cache/demo/f_000009.jpg",
+    ]
+    mapped = app_services.map_claim_to_keyframes(claim, keyframes)
+    assert mapped == [
+        "data/frame_cache/demo/f_000002.jpg",
+        "data/frame_cache/demo/f_000005.jpg",
+    ]
+
+
+def test_resolve_keyframe_metadata_exact_and_fallback(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    app_services.ensure_dirs()
+
+    keyframe = tmp_path / "data" / "frame_cache" / "demo" / "f_000004.jpg"
+    keyframe.parent.mkdir(parents=True, exist_ok=True)
+    img = np.full((48, 64, 3), 100, dtype=np.uint8)
+    assert cv2.imwrite(str(keyframe), img)
+
+    frames_json = tmp_path / "data" / "outputs" / "demo_frames.json"
+    frames_json.parent.mkdir(parents=True, exist_ok=True)
+    frames_json.write_text(
+        json.dumps(
+            {
+                "video_path": "data/raw_videos/demo.mp4",
+                "probe": {"fps": 30.0},
+                "frames": [
+                    {
+                        "frame_id": 4,
+                        "orig_frame_idx": 60,
+                        "time_sec": 2.0,
+                        "path": str(keyframe),
+                        "width": 64,
+                        "height": 48,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    exact = app_services.resolve_keyframe_metadata(
+        keyframe_path=str(keyframe),
+        frames_json_path=str(frames_json),
+        video_path=None,
+    )
+    assert exact["mapping_quality"] == "exact"
+    assert exact["sampled_frame_idx"] == 4
+    assert exact["source_frame_idx"] == 60
+    assert abs(float(exact["timestamp_sec"]) - 2.0) < 1e-9
+
+    fallback = app_services.resolve_keyframe_metadata(
+        keyframe_path="data/frame_cache/demo/f_000010.jpg",
+        frames_json_path=None,
+        video_path=None,
+    )
+    assert fallback["mapping_quality"] == "fallback"
+    assert fallback["sampled_frame_idx"] == 10
+    assert fallback["source_frame_idx"] is None
+    assert abs(float(fallback["timestamp_sec"]) - 5.0) < 1e-9
+
+
+def test_render_keyframe_with_tracks_draws_boxes_when_timestamp_matches(tmp_path: Path) -> None:
+    keyframe = tmp_path / "frame.jpg"
+    tracks_csv = tmp_path / "tracks.csv"
+    out_path = tmp_path / "frame_out.jpg"
+
+    img = np.full((120, 160, 3), 80, dtype=np.uint8)
+    assert cv2.imwrite(str(keyframe), img)
+    tracks_csv.write_text(
+        "\n".join(
+            [
+                "frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2",
+                "1,1.00,7,2,car,0.91,20,30,80,90",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    meta = app_services.render_keyframe_with_tracks(
+        keyframe_image_path=str(keyframe),
+        keyframe_timestamp_sec=1.04,
+        tracks_csv_path=str(tracks_csv),
+        out_path=str(out_path),
+        time_tolerance_sec=0.12,
+    )
+    assert out_path.exists()
+    assert meta["boxes_drawn"] == 1
+    assert meta["matched_rows"] == 1
+
+
+def test_render_keyframe_with_tracks_no_match_graceful(tmp_path: Path) -> None:
+    keyframe = tmp_path / "frame2.jpg"
+    tracks_csv = tmp_path / "tracks2.csv"
+    out_path = tmp_path / "frame2_out.jpg"
+
+    img = np.full((120, 160, 3), 80, dtype=np.uint8)
+    assert cv2.imwrite(str(keyframe), img)
+    tracks_csv.write_text(
+        "\n".join(
+            [
+                "frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2",
+                "1,1.00,8,0,person,0.88,10,10,40,80",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    meta = app_services.render_keyframe_with_tracks(
+        keyframe_image_path=str(keyframe),
+        keyframe_timestamp_sec=3.50,
+        tracks_csv_path=str(tracks_csv),
+        out_path=str(out_path),
+        time_tolerance_sec=0.05,
+    )
+    assert out_path.exists()
+    assert meta["boxes_drawn"] == 0
+    assert meta["matched_rows"] == 0
+    assert meta["matched_timestamp_sec"] is None
+
+
+def test_render_keyframe_with_tracks_scales_boxes_to_resized_keyframe(tmp_path: Path) -> None:
+    keyframe = tmp_path / "frame_scaled.jpg"
+    tracks_csv = tmp_path / "tracks_scaled.csv"
+    out_path = tmp_path / "frame_scaled_out.jpg"
+
+    img = np.full((100, 100, 3), 80, dtype=np.uint8)
+    assert cv2.imwrite(str(keyframe), img)
+    tracks_csv.write_text(
+        "\n".join(
+            [
+                "frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2,frame_width,frame_height",
+                "10,4.00,21,2,car,0.95,40,40,120,120,200,200",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    meta = app_services.render_keyframe_with_tracks(
+        keyframe_image_path=str(keyframe),
+        keyframe_timestamp_sec=4.0,
+        tracks_csv_path=str(tracks_csv),
+        out_path=str(out_path),
+        time_tolerance_sec=0.12,
+    )
+    assert out_path.exists()
+    assert meta["boxes_drawn"] == 1
+    assert meta["matched_rows"] == 1
+
+    rendered = cv2.imread(str(out_path), cv2.IMREAD_COLOR)
+    assert rendered is not None
+                                                                               
+                                                                                    
+    patch = rendered[18:25, 18:25]
+    assert np.any(patch != 80)
+
+
+def test_resolve_tracks_csv_for_report_finds_existing_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    outputs_dir = tmp_path / "data" / "outputs"
+    reports_dir = outputs_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    tracks_csv = outputs_dir / "cctv_006_tracks.csv"
+    tracks_csv.write_text("frame_idx,timestamp_sec\n", encoding="utf-8")
+
+    report_path = reports_dir / "cctv_006_s1_collision_report.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "meta": {"source_video": "data/raw_videos/cctv_006.mp4"},
+                "audit": {"notes": f"model_name=gpt-4.1-mini;track_source={tracks_csv}"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = app_services.resolve_tracks_csv_for_report(str(report_path), "data/raw_videos/cctv_006.mp4")
+    assert resolved is not None
+    assert Path(resolved).exists()
+
+
+def test_report_dropdown_hides_deprecated_duplicate_names(tmp_path: Path) -> None:
+    reports_dir = tmp_path / "data" / "outputs" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    clean = reports_dir / "cctv_006_s_collision_report.json"
+    deprecated = reports_dir / "cctv_006_s_collision_collision_report.json"
+    clean.write_text("{}", encoding="utf-8")
+    deprecated.write_text("{}", encoding="utf-8")
+
+    paths = app_services.list_report_files(tmp_path / "data" / "outputs", "cctv_006", show_deprecated=False)
+    names = {Path(path).name for path in paths}
+    assert "cctv_006_s_collision_report.json" in names
+    assert "cctv_006_s_collision_collision_report.json" not in names
+
+
+def test_run_assemble_uses_sidecar_model_when_item_missing_model(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    app_services.ensure_dirs()
+
+    perception_json = tmp_path / "data" / "outputs" / "demo_perception.json"
+    perception_json.parent.mkdir(parents=True, exist_ok=True)
+    perception_json.write_text(
+        json.dumps(
+            [
+                {
+                    "segment_id": "s_collision",
+                    "start_sec": 4.0,
+                    "end_sec": 10.0,
+                    "keyframes": ["data/frame_cache/demo/f_000008.jpg"],
+                    "perception": {
+                        "visible_actors": [{"type": "car", "confidence": 0.9, "description": "Sedan"}],
+                        "scene_conditions": {"weather": "clear", "lighting": "day", "road_surface": "dry"},
+                        "potential_conflicts": [
+                            {"type": "collision_risk", "confidence": 0.95, "description": "Possible collision risk."}
+                        ],
+                        "notes": "",
+                    },
+                    "status": "ok",
+                    "error": None,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    Path(f"{perception_json}.meta.json").write_text(
+        json.dumps({"model": "gpt-4.1-mini", "max_frames": 4}),
+        encoding="utf-8",
+    )
+
+    source_video = tmp_path / "data" / "raw_videos" / "demo.mp4"
+    source_video.parent.mkdir(parents=True, exist_ok=True)
+    source_video.write_bytes(b"fake")
+    out_dir = tmp_path / "data" / "outputs" / "reports"
+
+    result = app_services.run_assemble(str(perception_json), str(source_video), str(out_dir))
+    assert result["ok"] == 1
+    assert result["failed"] == 0
+    assert result["report_paths"]
+
+    report_payload = json.loads(Path(result["report_paths"][0]).read_text(encoding="utf-8"))
+    notes = str(report_payload.get("audit", {}).get("notes", ""))
+    assert "model_name=gpt-4.1-mini" in notes
+
+
+def test_summarize_claim_track_evidence_links_track_ids(tmp_path: Path) -> None:
+    claim = {"claim_id": "clm_001", "evidence_frames": [8, 10]}
+    keyframes = [
+        "data/frame_cache/demo/f_000008.jpg",
+        "data/frame_cache/demo/f_000010.jpg",
+        "data/frame_cache/demo/f_000012.jpg",
+    ]
+
+    csv_path = tmp_path / "tracks.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2",
+                "120,4.00,21,2,car,0.91,10,10,50,50",
+                "120,4.00,24,2,car,0.88,20,15,55,52",
+                "150,5.00,21,2,car,0.90,11,11,51,51",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    summary = app_services.summarize_claim_track_evidence(
+        claim=claim,
+        keyframe_paths=keyframes,
+        frames_json_path=None,
+        video_path=None,
+        tracks_csv_path=str(csv_path),
+        time_tolerance_sec=0.12,
+    )
+    assert summary["has_track_evidence"]
+    assert summary["unique_track_ids"] == 2
+    assert summary["track_ids"] == [21, 24]
+    assert summary["class_counts"]["car"] >= 2
+    assert summary["involved_track_ids"] == [21, 24]
+    assert abs(float(summary["involved_timestamp_sec"]) - 4.0) < 1e-9
+    assert summary["context_track_count"] == 0
+
+
+def test_summarize_claim_track_evidence_prefers_stronger_interaction_pair(tmp_path: Path) -> None:
+    claim = {"claim_id": "clm_001", "evidence_frames": [8, 10, 13]}
+    keyframes = [
+        "data/frame_cache/demo/f_000008.jpg",
+        "data/frame_cache/demo/f_000010.jpg",
+        "data/frame_cache/demo/f_000013.jpg",
+    ]
+
+    csv_path = tmp_path / "tracks_dense.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2",
+                "120,4.00,21,2,car,0.90,10,10,40,40",
+                "120,4.00,24,2,car,0.89,220,10,260,50",
+                "120,4.00,68,2,car,0.75,500,80,535,110",
+                "195,6.50,21,2,car,0.87,100,100,170,170",
+                "195,6.50,24,2,car,0.92,120,120,185,185",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    summary = app_services.summarize_claim_track_evidence(
+        claim=claim,
+        keyframe_paths=keyframes,
+        frames_json_path=None,
+        video_path=None,
+        tracks_csv_path=str(csv_path),
+        time_tolerance_sec=0.12,
+    )
+    assert summary["has_track_evidence"]
+    assert summary["involved_track_ids"] == [21, 24]
+    assert abs(float(summary["involved_timestamp_sec"]) - 6.5) < 1e-9
+    candidates = summary.get("impact_pair_candidates", [])
+    assert isinstance(candidates, list) and candidates
+    assert candidates[0]["pair"] == [21, 24]
+
+
+def test_evaluate_claim_visual_support_prefers_interaction_over_box_count(tmp_path: Path) -> None:
+    claim = {"claim_id": "clm_001", "evidence_frames": [8, 13]}
+    keyframes = [
+        "data/frame_cache/demo/f_000008.jpg",
+        "data/frame_cache/demo/f_000013.jpg",
+    ]
+
+    csv_path = tmp_path / "tracks_support.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2",
+                                                                       
+                "120,4.00,21,2,car,0.90,10,10,35,35",
+                "120,4.00,24,2,car,0.91,200,10,240,50",
+                "120,4.00,68,2,car,0.87,350,30,390,70",
+                                                                      
+                "195,6.50,21,2,car,0.89,100,100,170,170",
+                "195,6.50,24,2,car,0.92,120,120,185,185",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    summary = app_services.evaluate_claim_visual_support(
+        claim=claim,
+        keyframe_paths=keyframes,
+        frames_json_path=None,
+        video_path=None,
+        tracks_csv_path=str(csv_path),
+    )
+    assert summary["has_visual_boxes_any_evidence_frame"] is True
+    assert summary["strongest_evidence_frame"].endswith("f_000013.jpg")
+    assert summary["visual_support_level"] in {"strong", "partial"}
+    assert summary["strongest_pair_hint"] == [21, 24]
+
+
+def test_derive_actors_from_involvement_uses_primary_track_ids(tmp_path: Path) -> None:
+    report_json = {
+        "segments": [
+            {
+                "segment_id": "s_collision",
+                "claims": [
+                    {"claim_id": "clm_001"},
+                    {"claim_id": "clm_002"},
+                ],
+            }
+        ]
+    }
+    involvement_map = {
+        "clm_001": {"primary_track_ids": [100, 118]},
+        "clm_002": {"primary_track_ids": [118, 130]},
+    }
+    tracks_csv = tmp_path / "tracks.csv"
+    tracks_csv.write_text(
+        "\n".join(
+            [
+                "frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2",
+                "1,1.0,100,2,car,0.95,1,1,2,2",
+                "2,1.1,100,2,car,0.90,1,1,2,2",
+                "1,1.0,118,2,car,0.92,1,1,2,2",
+                "1,1.0,130,0,person,0.88,1,1,2,2",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    actors = app_services.derive_actors_from_involvement(
+        report_json=report_json,
+        claim_involvement_map=involvement_map,
+        tracks_csv_path=str(tracks_csv),
+    )
+    assert [actor["track_id"] for actor in actors] == [100, 118, 130]
+    assert [actor["role"] for actor in actors] == ["car", "car", "pedestrian"]
+    assert all("Directly involved" in str(actor["description"]) for actor in actors)
+
+
+def test_derive_actors_from_involvement_excludes_secondary_when_primary_exists(tmp_path: Path) -> None:
+    report_json = {
+        "segments": [
+            {
+                "segment_id": "s_collision",
+                "claims": [{"claim_id": "clm_001"}],
+            }
+        ]
+    }
+    involvement_map = {
+        "clm_001": {"primary_track_ids": [21, 118], "secondary_track_ids": [24]},
+    }
+    tracks_csv = tmp_path / "tracks.csv"
+    tracks_csv.write_text(
+        "\n".join(
+            [
+                "frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2",
+                "1,1.0,21,2,car,0.95,1,1,2,2",
+                "1,1.0,118,2,car,0.92,1,1,2,2",
+                "1,1.0,24,2,car,0.88,1,1,2,2",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    actors = app_services.derive_actors_from_involvement(
+        report_json=report_json,
+        claim_involvement_map=involvement_map,
+        tracks_csv_path=str(tracks_csv),
+    )
+    assert [actor["track_id"] for actor in actors] == [21, 118]
+
+
+def test_cleanup_clip_outputs_removes_clip_artifacts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    app_services.ensure_dirs()
+
+    video = tmp_path / "data" / "raw_videos" / "demo.mp4"
+    video.parent.mkdir(parents=True, exist_ok=True)
+    video.write_bytes(b"fake")
+
+    outputs = tmp_path / "data" / "outputs"
+    (outputs / "demo_frames.json").write_text("{}", encoding="utf-8")
+    (outputs / "demo_segments.csv").write_text("segment_id,start_sec,end_sec\n", encoding="utf-8")
+    (outputs / "demo_tracks.csv").write_text("frame_idx,timestamp_sec\n", encoding="utf-8")
+    reports_dir = outputs / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "demo_s1_collision_report.json").write_text("{}", encoding="utf-8")
+
+    cache_dir = tmp_path / "data" / "frame_cache" / "demo"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "f_000000.jpg").write_bytes(b"x")
+
+    result = app_services.cleanup_clip_outputs(video_path=str(video), outputs_dir=str(outputs))
+    assert result["removed_files"] >= 3
+    assert not (outputs / "demo_frames.json").exists()
+    assert not (outputs / "demo_tracks.csv").exists()
+    assert not (reports_dir / "demo_s1_collision_report.json").exists()
+    assert not cache_dir.exists()
+
+
+def test_run_full_fresh_rebuild_orchestrates_pipeline(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    app_services.ensure_dirs()
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    video = tmp_path / "data" / "raw_videos" / "demo.mp4"
+    video.parent.mkdir(parents=True, exist_ok=True)
+    video.write_bytes(b"fake")
+
+    outputs = tmp_path / "data" / "outputs"
+    outputs.mkdir(parents=True, exist_ok=True)
+    reports_dir = outputs / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    primary_report = reports_dir / "demo_s1_collision_report.json"
+    primary_report.write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "segment_id": "s1",
+                        "claims": [{"claim_id": "clm_001", "event_type": "collision", "support_confidence": 0.9}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tracks_csv = outputs / "demo_tracks.csv"
+    tracks_csv.write_text("frame_idx,timestamp_sec,track_id,class_id,class_name,conf,x1,y1,x2,y2\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        app_services,
+        "run_ingest_segment",
+        lambda **_kwargs: {
+            "frames_json": str(outputs / "demo_frames.json"),
+            "segments_csv": str(outputs / "demo_segments.csv"),
+            "segment_count": 2,
+        },
+    )
+    monkeypatch.setattr(
+        app_services,
+        "run_detecttrack",
+        lambda **_kwargs: {
+            "tracks_csv": str(tracks_csv),
+            "summary_json": str(outputs / "demo_tracks_summary.json"),
+            "annotated_video": str(outputs / "demo_annotated.webm"),
+            "num_tracks": 5,
+            "num_detections": 100,
+        },
+    )
+    monkeypatch.setattr(
+        app_services,
+        "run_perceive",
+        lambda **_kwargs: {
+            "perception_json": str(outputs / "demo_perception.json"),
+            "ok": 2,
+            "failed": 0,
+            "reused_cache": False,
+        },
+    )
+    monkeypatch.setattr(
+        app_services,
+        "run_assemble",
+        lambda **_kwargs: {
+            "report_paths": [str(primary_report)],
+            "ok": 1,
+            "failed": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "src.involvement.run_involvement_for_report",
+        lambda **_kwargs: {"out_json": str(outputs / "demo_involvement.json"), "claims": 1, "ai_used": 1, "fallback_used": 0},
+    )
+
+    result = app_services.run_full_fresh_rebuild(
+        video_path=str(video),
+        outputs_dir=str(outputs),
+    )
+    assert result["segment_count"] == 2
+    assert result["num_tracks"] == 5
+    assert result["perception_ok"] == 2
+    assert result["assemble_ok"] == 1
+    assert str(primary_report) == result["primary_report_path"]
+    assert str(outputs / "demo_involvement.json") == result["involvement_json"]
+
+
+def test_select_primary_report_prefers_collision_focus_when_confidence_ties(tmp_path: Path) -> None:
+    reports = tmp_path / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+
+    s2_path = reports / "demo_s2_collision_report.json"
+    s2_path.write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "segment_id": "s2",
+                        "start_sec": 4.3,
+                        "end_sec": 8.3,
+                        "claims": [
+                            {"claim_id": "clm_001", "event_type": "collision", "support_confidence": 1.0},
+                            {"claim_id": "clm_002", "event_type": "collision", "support_confidence": 0.8},
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    s3_path = reports / "demo_s3_collision_report.json"
+    s3_path.write_text(
+        json.dumps(
+            {
+                "segments": [
+                    {
+                        "segment_id": "s3",
+                        "start_sec": 8.5,
+                        "end_sec": 10.5,
+                        "claims": [
+                            {"claim_id": "clm_001", "event_type": "collision", "support_confidence": 1.0},
+                            {"claim_id": "clm_002", "event_type": "obstruction", "support_confidence": 1.0},
+                            {"claim_id": "clm_003", "event_type": "near_miss", "support_confidence": 0.7},
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    selected = app_services._select_primary_report_path([str(s2_path), str(s3_path)])
+    assert selected == str(s2_path)

@@ -1,0 +1,1101 @@
+from __future__ import annotations
+
+import re
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from PySide6.QtCore import QUrl, Qt
+from PySide6.QtGui import QAction, QPixmap
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QHeaderView,
+    QSlider,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from . import app_services as services
+
+
+NOTE_SPLIT_PATTERN = re.compile(r"\s*;\s*")
+
+
+def _parse_note_pairs(notes: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for part in NOTE_SPLIT_PATTERN.split(str(notes).strip()):
+        piece = part.strip()
+        if not piece:
+            continue
+        if "=" in piece:
+            key, value = piece.split("=", 1)
+            rows.append((key.strip(), value.strip()))
+        else:
+            rows.append(("note", piece))
+    return rows
+
+
+def _first_existing(paths: list[Path]) -> Path | None:
+    for path in paths:
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+class AspectImageLabel(QLabel):
+    def __init__(self) -> None:
+        super().__init__()
+        self._source_pixmap: QPixmap | None = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setText("No evidence frame loaded.")
+        self.setMinimumHeight(280)
+
+    def set_image_path(self, image_path: str | Path) -> None:
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            self._source_pixmap = None
+            self.setText(f"Unable to load image: {image_path}")
+            return
+        self._source_pixmap = pixmap
+        self._rescale()
+
+    def clear_image(self, message: str = "No evidence frame loaded.") -> None:
+        self._source_pixmap = None
+        self.clear()
+        self.setText(message)
+
+    def resizeEvent(self, event: Any) -> None:                            
+        super().resizeEvent(event)
+        self._rescale()
+
+    def _rescale(self) -> None:
+        if self._source_pixmap is None:
+            return
+        scaled = self._source_pixmap.scaled(
+            self.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.setPixmap(scaled)
+
+
+@dataclass
+class KeyframeRow:
+    label: str
+    path: str
+    meta: dict[str, Any]
+
+
+class IncidentReviewerWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Traffic Incident Reporter - Desktop Review")
+        self.resize(1640, 960)
+
+        self.outputs_dir = Path("data/outputs")
+        self.clip_stem = ""
+        self.frames_json_path: Path | None = None
+        self.perception_json_path: Path | None = None
+        self.source_video_path: str | None = None
+        self.current_report_path: str | None = None
+        self.track_source_path: str | None = None
+        self.current_report_payload: dict[str, Any] = {}
+        self.current_segment: dict[str, Any] = {}
+        self.current_perception: dict[str, Any] = {}
+        self.report_paths: list[str] = []
+        self.perception_items: list[dict[str, Any]] = []
+        self.claims: list[dict[str, Any]] = []
+        self.claim_track_evidence_map: dict[str, dict[str, Any]] = {}
+        self.claim_involvement_map: dict[str, dict[str, Any]] = {}
+        self.involvement_segment_id: str | None = None
+        self.keyframe_rows: list[KeyframeRow] = []
+        self.strongest_frame_for_claim: str | None = None
+        self.rendered_frame_path: str | None = None
+
+        self._build_ui()
+        self._apply_styles()
+        self._load_case()
+    def _build_ui(self) -> None:
+        root = QWidget()
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(14, 12, 14, 12)
+        root_layout.setSpacing(10)
+        self.setCentralWidget(root)
+
+        controls_group = QGroupBox("Case Loader")
+        controls_layout = QGridLayout(controls_group)
+        controls_layout.addWidget(QLabel("Outputs directory"), 0, 0)
+        self.outputs_input = QLineEdit(str(self.outputs_dir))
+        controls_layout.addWidget(self.outputs_input, 0, 1)
+        browse_outputs = QPushButton("Browse")
+        browse_outputs.clicked.connect(self._on_browse_outputs)
+        controls_layout.addWidget(browse_outputs, 0, 2)
+
+        controls_layout.addWidget(QLabel("Clip stem"), 1, 0)
+        self.stem_input = QLineEdit(self.clip_stem)
+        self.stem_input.setPlaceholderText("Enter clip stem (e.g., camera_001)")
+        controls_layout.addWidget(self.stem_input, 1, 1)
+        self.load_button = QPushButton("Load Case")
+        self.load_button.clicked.connect(self._load_case)
+        controls_layout.addWidget(self.load_button, 1, 2)
+
+        controls_layout.addWidget(QLabel("Pipeline"), 2, 0)
+        self.rebuild_note = QLabel("Runs clean rebuild: ingest -> segment -> detecttrack -> perceive -> assemble -> involve")
+        self.rebuild_note.setObjectName("muted")
+        controls_layout.addWidget(self.rebuild_note, 2, 1)
+        self.rebuild_button = QPushButton("Full Fresh Rebuild")
+        self.rebuild_button.clicked.connect(self._on_full_rebuild)
+        controls_layout.addWidget(self.rebuild_button, 2, 2)
+        root_layout.addWidget(controls_group)
+
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        left_splitter = QSplitter(Qt.Orientation.Vertical)
+        main_splitter.addWidget(left_splitter)
+
+        left_top = QGroupBox("Incident Video")
+        left_top_layout = QVBoxLayout(left_top)
+        self.video_widget = QVideoWidget()
+        self.video_widget.setMinimumHeight(280)
+        left_top_layout.addWidget(self.video_widget)
+
+        video_controls = QHBoxLayout()
+        self.play_pause_btn = QPushButton("Play")
+        self.play_pause_btn.clicked.connect(self._on_play_pause)
+        video_controls.addWidget(self.play_pause_btn)
+        self.video_slider = QSlider(Qt.Orientation.Horizontal)
+        self.video_slider.setRange(0, 0)
+        self.video_slider.sliderMoved.connect(self._on_video_seek)
+        video_controls.addWidget(self.video_slider)
+        self.video_time_label = QLabel("00:00 / 00:00")
+        video_controls.addWidget(self.video_time_label)
+        video_controls.addWidget(QLabel("Speed"))
+        self.playback_speed_combo = QComboBox()
+        self.playback_speed_combo.addItem("0.50x", userData=0.5)
+        self.playback_speed_combo.addItem("0.75x", userData=0.75)
+        self.playback_speed_combo.addItem("1.00x", userData=1.0)
+        self.playback_speed_combo.addItem("1.25x", userData=1.25)
+        self.playback_speed_combo.addItem("1.50x", userData=1.5)
+        self.playback_speed_combo.setCurrentIndex(2)
+        self.playback_speed_combo.currentIndexChanged.connect(self._on_playback_speed_changed)
+        video_controls.addWidget(self.playback_speed_combo)
+        left_top_layout.addLayout(video_controls)
+
+        left_bottom = QGroupBox("Evidence Frame Inspector")
+        left_bottom_layout = QVBoxLayout(left_bottom)
+        select_row = QHBoxLayout()
+        self.keyframe_combo = QComboBox()
+        self.keyframe_combo.currentIndexChanged.connect(self._on_keyframe_changed)
+        select_row.addWidget(self.keyframe_combo, 1)
+        self.jump_button = QPushButton("Jump to strongest evidence frame")
+        self.jump_button.clicked.connect(self._on_jump_strongest_frame)
+        self.jump_button.setEnabled(False)
+        select_row.addWidget(self.jump_button)
+        left_bottom_layout.addLayout(select_row)
+        self.evidence_image = AspectImageLabel()
+        left_bottom_layout.addWidget(self.evidence_image, 1)
+        self.evidence_meta_label = QLabel("No keyframe selected.")
+        self.evidence_meta_label.setObjectName("muted")
+        left_bottom_layout.addWidget(self.evidence_meta_label)
+
+        left_splitter.addWidget(left_top)
+        left_splitter.addWidget(left_bottom)
+        left_splitter.setStretchFactor(0, 55)
+        left_splitter.setStretchFactor(1, 45)
+
+        right_panel = QGroupBox("Incident Assessment")
+        right_layout = QVBoxLayout(right_panel)
+
+        self.report_combo = QComboBox()
+        self.report_combo.currentIndexChanged.connect(self._on_report_changed)
+        right_layout.addWidget(self.report_combo)
+
+        right_splitter = QSplitter(Qt.Orientation.Vertical)
+        right_splitter.setChildrenCollapsible(False)
+        right_layout.addWidget(right_splitter, 1)
+
+        triage_group = QGroupBox("Triage Summary")
+        triage_form = QFormLayout(triage_group)
+        self.summary_event = QLabel("-")
+        self.summary_severity = QLabel("-")
+        self.summary_review = QLabel("-")
+        self.summary_window = QLabel("-")
+        self.summary_claims = QLabel("-")
+        self.summary_uncertainty = QLabel("-")
+        triage_form.addRow("Event type", self.summary_event)
+        triage_form.addRow("Severity", self.summary_severity)
+        triage_form.addRow("Review required", self.summary_review)
+        triage_form.addRow("Segment window", self.summary_window)
+        triage_form.addRow("Claims", self.summary_claims)
+        triage_form.addRow("Uncertainty", self.summary_uncertainty)
+        right_splitter.addWidget(triage_group)
+
+        claims_group = QGroupBox("Claims")
+        claims_layout = QVBoxLayout(claims_group)
+        self.claims_table = QTableWidget(0, 6)
+        self.claims_table.setHorizontalHeaderLabels(
+            ["Claim ID", "Event", "Confidence", "Evidence", "Involved Tracks", "Visual support"]
+        )
+        claims_header = self.claims_table.horizontalHeader()
+        claims_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        claims_header.setStretchLastSection(False)
+        self.claims_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.claims_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.claims_table.cellClicked.connect(self._on_claim_selected)
+        claims_splitter = QSplitter(Qt.Orientation.Vertical)
+        claims_splitter.setChildrenCollapsible(False)
+        claims_splitter.addWidget(self.claims_table)
+        self.claim_detail = QTextEdit()
+        self.claim_detail.setReadOnly(True)
+        self.claim_detail.setMinimumHeight(110)
+        claims_splitter.addWidget(self.claim_detail)
+        claims_splitter.setSizes([260, 170])
+        claims_layout.addWidget(claims_splitter)
+        right_splitter.addWidget(claims_group)
+        actors_group = QGroupBox("Actors")
+        actors_layout = QVBoxLayout(actors_group)
+        self.actors_table = QTableWidget(0, 3)
+        self.actors_table.setHorizontalHeaderLabels(["Actor ID", "Role", "Description"])
+        actors_header = self.actors_table.horizontalHeader()
+        actors_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        actors_header.setStretchLastSection(False)
+        actors_layout.addWidget(self.actors_table)
+        right_splitter.addWidget(actors_group)
+
+        provenance_group = QGroupBox("Audit & Provenance")
+        provenance_layout = QVBoxLayout(provenance_group)
+        self.provenance_table = QTableWidget(0, 2)
+        self.provenance_table.setHorizontalHeaderLabels(["Field", "Value"])
+        provenance_header = self.provenance_table.horizontalHeader()
+        provenance_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        provenance_header.setStretchLastSection(False)
+        provenance_layout.addWidget(self.provenance_table)
+        right_splitter.addWidget(provenance_group)
+
+        review_group = QGroupBox("Reviewer Decision")
+        review_layout = QGridLayout(review_group)
+        review_layout.addWidget(QLabel("Override event"), 0, 0)
+        self.override_event = QComboBox()
+        self.override_event.addItems(["keep", "none", "near_miss", "collision", "obstruction", "violation"])
+        review_layout.addWidget(self.override_event, 0, 1)
+        review_layout.addWidget(QLabel("Override severity"), 1, 0)
+        self.override_severity = QComboBox()
+        self.override_severity.addItems(["keep", "low", "medium", "high", "unknown"])
+        review_layout.addWidget(self.override_severity, 1, 1)
+        review_layout.addWidget(QLabel("Reviewer note"), 2, 0, 1, 2)
+        self.reviewer_note = QTextEdit()
+        self.reviewer_note.setPlaceholderText("Add a concise reviewer rationale for overrides.")
+        self.reviewer_note.setMinimumHeight(90)
+        review_layout.addWidget(self.reviewer_note, 3, 0, 1, 2)
+        self.save_review_button = QPushButton("Save Reviewed Copy")
+        self.save_review_button.clicked.connect(self._on_save_reviewed_copy)
+        review_layout.addWidget(self.save_review_button, 4, 0, 1, 2)
+        right_splitter.addWidget(review_group)
+        right_splitter.setSizes([180, 320, 200, 220, 210])
+
+        main_splitter.addWidget(right_panel)
+        main_splitter.setStretchFactor(0, 50)
+        main_splitter.setStretchFactor(1, 50)
+        root_layout.addWidget(main_splitter, 1)
+
+        self.player = QMediaPlayer(self)
+        self.audio = QAudioOutput(self)
+        self.player.setAudioOutput(self.audio)
+        self.player.setVideoOutput(self.video_widget)
+        self.player.setPlaybackRate(1.0)
+        self.player.positionChanged.connect(self._on_video_position_changed)
+        self.player.durationChanged.connect(self._on_video_duration_changed)
+        self.player.playbackStateChanged.connect(self._on_playback_state_changed)
+
+        reload_action = QAction("Reload Case", self)
+        reload_action.triggered.connect(self._load_case)
+        self.addAction(reload_action)
+        self.statusBar().showMessage("Ready")
+
+    def _apply_styles(self) -> None:
+        self.setStyleSheet(
+            """
+            QWidget {
+              background-color: #11141c;
+              color: #e5e7eb;
+              font-family: Segoe UI;
+              font-size: 13px;
+            }
+            QMainWindow {
+              background-color: #11141c;
+            }
+            QGroupBox {
+              border: 1px solid #2a3140;
+              border-radius: 8px;
+              margin-top: 8px;
+              padding-top: 10px;
+              font-weight: 600;
+              background-color: #171b24;
+            }
+            QGroupBox::title {
+              subcontrol-origin: margin;
+              left: 10px;
+              padding: 0 4px 0 4px;
+              color: #9ac1ff;
+            }
+            QLabel#muted {
+              color: #9ba4b5;
+            }
+            QPushButton {
+              border: 1px solid #3a4558;
+              border-radius: 6px;
+              padding: 6px 10px;
+              background-color: #1f2633;
+            }
+            QPushButton:hover {
+              background-color: #273145;
+            }
+            QLineEdit, QComboBox, QTextEdit, QTableWidget {
+              background-color: #0f131b;
+              border: 1px solid #2d3647;
+              border-radius: 5px;
+            }
+            QHeaderView::section {
+              background-color: #1d2533;
+              color: #dbe2f2;
+              padding: 4px;
+              border: 1px solid #2b3444;
+            }
+            QTableWidget {
+              gridline-color: #2b3343;
+              selection-background-color: #30476f;
+            }
+            QSplitter::handle {
+              background-color: #2b3444;
+            }
+            QSplitter::handle:horizontal {
+              width: 4px;
+            }
+            QSplitter::handle:vertical {
+              height: 4px;
+            }
+            """
+        )
+
+    def _on_browse_outputs(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "Select outputs directory", str(self.outputs_dir))
+        if selected:
+            self.outputs_input.setText(selected)
+
+    def _on_full_rebuild(self) -> None:
+        outputs_text = self.outputs_input.text().strip() or "data/outputs"
+        stem = self.stem_input.text().strip() or "clip"
+        video_path = Path("data") / "raw_videos" / f"{stem}.mp4"
+        if not video_path.exists() or not video_path.is_file():
+            QMessageBox.warning(
+                self,
+                "Video not found",
+                f"Source video not found for clip stem '{stem}':\n{video_path}",
+            )
+            return
+
+        self.rebuild_button.setEnabled(False)
+        self.load_button.setEnabled(False)
+        self.statusBar().showMessage("Running full fresh rebuild. This can take a while...")
+        try:
+            result = services.run_full_fresh_rebuild(
+                video_path=str(video_path),
+                outputs_dir=outputs_text,
+                model="gpt-4.1",
+                max_frames=12,
+                tracker="botsort.yaml",
+                conf=0.25,
+                iou=0.5,
+                classes=["person", "bicycle", "car", "motorcycle", "bus", "truck"],
+                save_annotated=True,
+                enhance_claims=True,
+                writer_model="gpt-4.1",
+                writer_max_frames=12,
+                writer_max_retries=2,
+                require_claim_writer=False,
+                involvement_model="gpt-4.1",
+                involvement_max_frames=8,
+                involvement_use_ai=True,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Rebuild failed", str(exc))
+            self.statusBar().showMessage("Full fresh rebuild failed.")
+            self.rebuild_button.setEnabled(True)
+            self.load_button.setEnabled(True)
+            return
+
+        self.outputs_input.setText(outputs_text)
+        self.stem_input.setText(stem)
+        self._load_case()
+        self.statusBar().showMessage("Full fresh rebuild completed.")
+        self.rebuild_button.setEnabled(True)
+        self.load_button.setEnabled(True)
+        QMessageBox.information(
+            self,
+            "Rebuild complete",
+            (
+                f"Segments: {result.get('segment_count', 0)}\n"
+                f"Perception OK: {result.get('perception_ok', 0)}\n"
+                f"Reports: {result.get('assemble_ok', 0)}\n"
+                f"Primary report: {result.get('primary_report_path', 'n/a')}"
+            ),
+        )
+
+    def _load_case(self) -> None:
+        services.ensure_dirs()
+        outputs_text = self.outputs_input.text().strip() or "data/outputs"
+        stem = self.stem_input.text().strip() or "clip"
+        self.outputs_dir = Path(outputs_text)
+        self.clip_stem = stem
+
+        perception_candidates = [
+            self.outputs_dir / f"{stem}_perception.json",
+            self.outputs_dir / f"{stem}_perception_manual.json",
+        ]
+        frames_candidates = [self.outputs_dir / f"{stem}_frames.json"]
+        video_candidates = [
+            self.outputs_dir / f"{stem}_annotated.mp4",
+            self.outputs_dir / f"{stem}_annotated.avi",
+            self.outputs_dir / f"{stem}_annotated.webm",
+        ]
+
+        self.perception_json_path = _first_existing(perception_candidates)
+        self.frames_json_path = _first_existing(frames_candidates)
+        annotated_video = _first_existing(video_candidates)
+        involvement_path = self.outputs_dir / f"{stem}_involvement.json"
+        self.claim_involvement_map = {}
+        self.involvement_segment_id = None
+        if involvement_path.exists() and involvement_path.is_file():
+            try:
+                involvement_payload = services.load_json(involvement_path)
+            except Exception:
+                involvement_payload = {}
+            if isinstance(involvement_payload, dict):
+                maybe_segment_id = str(involvement_payload.get("segment_id", "")).strip()
+                self.involvement_segment_id = maybe_segment_id or None
+            claims_payload = involvement_payload.get("claims", []) if isinstance(involvement_payload, dict) else []
+            if isinstance(claims_payload, list):
+                for item in claims_payload:
+                    if not isinstance(item, dict):
+                        continue
+                    claim_id = str(item.get("claim_id", "")).strip()
+                    if claim_id:
+                        self.claim_involvement_map[claim_id] = item
+
+        if self.perception_json_path and self.perception_json_path.exists():
+            loaded = services.load_json(self.perception_json_path)
+            self.perception_items = [item for item in loaded if isinstance(item, dict)] if isinstance(loaded, list) else []
+        else:
+            self.perception_items = []
+
+        all_report_paths = services.list_report_files(self.outputs_dir, stem, show_deprecated=False)
+        perception_segment_ids = {
+            str(item.get("segment_id", "")).strip()
+            for item in self.perception_items
+            if isinstance(item, dict) and str(item.get("segment_id", "")).strip()
+        }
+        if perception_segment_ids:
+            filtered_paths: list[str] = []
+            for path in all_report_paths:
+                try:
+                    payload = services.load_json(path)
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                segments = payload.get("segments", [])
+                segment = segments[0] if isinstance(segments, list) and segments and isinstance(segments[0], dict) else {}
+                seg_id = str(segment.get("segment_id", "")).strip()
+                if seg_id in perception_segment_ids:
+                    filtered_paths.append(path)
+            self.report_paths = filtered_paths or all_report_paths
+        else:
+            self.report_paths = all_report_paths
+
+        self.report_combo.blockSignals(True)
+        self.report_combo.clear()
+        for path in self.report_paths:
+            self.report_combo.addItem(Path(path).name, userData=path)
+        self.report_combo.blockSignals(False)
+
+        if annotated_video is not None:
+            self.player.setSource(QUrl.fromLocalFile(str(annotated_video.resolve())))
+            self.statusBar().showMessage(f"Loaded video: {annotated_video.name}")
+        else:
+            self.player.setSource(QUrl())
+            self.statusBar().showMessage("Annotated video not found. Run detecttrack with --save-annotated true.")
+
+        if not self.report_paths:
+            self._clear_assessment("No report files found for this clip stem.")
+            return
+        best_index = self._best_report_index()
+        self.report_combo.setCurrentIndex(best_index)
+        self._on_report_changed(best_index)
+
+    def _best_report_index(self) -> int:
+        if not self.report_paths:
+            return 0
+
+        clip_end = 0.0
+        for item in self.perception_items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                clip_end = max(clip_end, float(item.get("end_sec", 0.0)))
+            except Exception:
+                continue
+        clip_mid = clip_end / 2.0 if clip_end > 0 else None
+
+        best_idx = 0
+        best_score: tuple[float, ...] | None = None
+        for idx, path in enumerate(self.report_paths):
+            score = self._score_report(path, clip_mid)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_idx = idx
+        return best_idx
+
+    def _score_report(self, report_path: str, clip_mid: float | None) -> tuple[float, ...]:
+        try:
+            return services.score_report_for_selection(report_path=report_path, clip_mid_sec=clip_mid)
+        except Exception:
+            return (0.0, 0.0, 0.0, 0.0, -1e6, -1e6, 0.0, -1e6)
+
+    def _clear_assessment(self, message: str) -> None:
+        self.summary_event.setText("-")
+        self.summary_severity.setText("-")
+        self.summary_review.setText("-")
+        self.summary_window.setText("-")
+        self.summary_claims.setText("-")
+        self.summary_uncertainty.setText("-")
+        self.claim_track_evidence_map = {}
+        self.claim_involvement_map = {}
+        self.involvement_segment_id = None
+        self.claims_table.setRowCount(0)
+        self.claim_detail.setPlainText(message)
+        self.actors_table.setRowCount(0)
+        self.provenance_table.setRowCount(0)
+        self.keyframe_combo.clear()
+        self.evidence_image.clear_image(message)
+        self.evidence_meta_label.setText(message)
+    def _on_report_changed(self, index: int) -> None:
+        if index < 0 or index >= len(self.report_paths):
+            self._clear_assessment("No report selected.")
+            return
+
+        report_path = self.report_paths[index]
+        payload = services.load_json(report_path)
+        if not isinstance(payload, dict):
+            self._clear_assessment(f"Invalid report JSON: {report_path}")
+            return
+
+        self.current_report_path = report_path
+        self.current_report_payload = payload
+
+        summary = services.extract_summary(payload)
+        meta = payload.get("meta", {}) if isinstance(payload.get("meta"), dict) else {}
+        self.source_video_path = str(meta.get("source_video", "")).strip() or str(Path("data/raw_videos") / f"{self.clip_stem}.mp4")
+        segments = payload.get("segments", [])
+        self.current_segment = segments[0] if isinstance(segments, list) and segments and isinstance(segments[0], dict) else {}
+        segment_id = str(self.current_segment.get("segment_id", "")).strip()
+        self.current_perception = self._match_perception_item(segment_id)
+
+        seg_start = float(self.current_perception.get("start_sec", self.current_segment.get("start_sec", 0.0)))
+        seg_end = float(self.current_perception.get("end_sec", self.current_segment.get("end_sec", seg_start)))
+        self.summary_event.setText(str(summary["event_type"]))
+        self.summary_severity.setText(str(summary["severity"]))
+        self.summary_review.setText("Yes" if bool(summary["review_required"]) else "No")
+        self.summary_window.setText(f"{seg_start:.2f}s - {seg_end:.2f}s")
+        self.summary_claims.setText(str(summary["claims_count"]))
+        self.summary_uncertainty.setText(", ".join(str(flag) for flag in summary["uncertainty_flags"]) or "None")
+
+        self.claims = [c for c in self.current_segment.get("claims", []) if isinstance(c, dict)]
+        self.track_source_path = services.resolve_tracks_csv_for_report(report_path, self.source_video_path)
+        self._populate_claims()
+        self._populate_actors()
+        self._populate_provenance()
+
+        if self.claims:
+            self.claims_table.selectRow(0)
+            self._on_claim_selected(0, 0)
+        else:
+            self._set_claim_detail(None)
+            self._refresh_keyframes(None)
+
+    def _match_perception_item(self, segment_id: str) -> dict[str, Any]:
+        if not self.perception_items:
+            return {}
+        for item in self.perception_items:
+            if str(item.get("segment_id", "")).strip() == segment_id:
+                return item
+        return self.perception_items[0]
+
+    def _populate_claims(self) -> None:
+        self.claims_table.setRowCount(0)
+        self.claim_track_evidence_map = {}
+        keyframes_raw = self.current_perception.get("keyframes", [])
+        keyframes_for_segment = [str(path) for path in keyframes_raw] if isinstance(keyframes_raw, list) else []
+
+        for claim in self.claims:
+            row = self.claims_table.rowCount()
+            self.claims_table.insertRow(row)
+
+            claim_id = str(claim.get("claim_id", f"claim_{row+1}"))
+            event_type = str(claim.get("event_type", "unknown"))
+            confidence = float(claim.get("support_confidence", 0.0))
+            evidence_frames = claim.get("evidence_frames", [])
+            evidence_count = len(evidence_frames) if isinstance(evidence_frames, list) else 0
+            visual = services.evaluate_claim_visual_support(
+                claim=claim,
+                keyframe_paths=keyframes_for_segment,
+                frames_json_path=str(self.frames_json_path) if self.frames_json_path else None,
+                video_path=self.source_video_path,
+                tracks_csv_path=self.track_source_path,
+            )
+            visual_level = str(visual.get("visual_support_level", "weak"))
+            track_evidence = services.summarize_claim_track_evidence(
+                claim=claim,
+                keyframe_paths=keyframes_for_segment,
+                frames_json_path=str(self.frames_json_path) if self.frames_json_path else None,
+                video_path=self.source_video_path,
+                tracks_csv_path=self.track_source_path,
+            )
+            self.claim_track_evidence_map[claim_id] = track_evidence
+            involved_ids = track_evidence.get("involved_track_ids", [])
+            involvement = self._involvement_for_claim(claim_id)
+            if isinstance(involvement, dict):
+                ai_primary = involvement.get("primary_track_ids", [])
+                if isinstance(ai_primary, list) and ai_primary:
+                    involved_ids = [int(tid) for tid in ai_primary if str(tid).strip()]
+            if isinstance(involved_ids, list) and involved_ids:
+                preview_ids = ",".join(str(track_id) for track_id in involved_ids[:2])
+                context_count = int(track_evidence.get("context_track_count", 0))
+                if context_count > 0:
+                    preview_ids = f"{preview_ids} (+{context_count})"
+            else:
+                preview_ids = "-"
+
+            self.claims_table.setItem(row, 0, QTableWidgetItem(claim_id))
+            self.claims_table.setItem(row, 1, QTableWidgetItem(event_type))
+            self.claims_table.setItem(row, 2, QTableWidgetItem(f"{confidence:.2f}"))
+            self.claims_table.setItem(row, 3, QTableWidgetItem(str(evidence_count)))
+            self.claims_table.setItem(row, 4, QTableWidgetItem(preview_ids))
+            self.claims_table.setItem(row, 5, QTableWidgetItem(visual_level))
+
+    def _populate_actors(self) -> None:
+        derived_rows = services.derive_actors_from_involvement(
+            report_json=self.current_report_payload,
+            claim_involvement_map=self.claim_involvement_map,
+            tracks_csv_path=self.track_source_path,
+        )
+        if derived_rows:
+            rows = [actor for actor in derived_rows if isinstance(actor, dict)]
+        else:
+            actors = self.current_report_payload.get("actors", [])
+            rows = [actor for actor in actors if isinstance(actor, dict)] if isinstance(actors, list) else []
+        self.actors_table.setRowCount(0)
+        for actor in rows:
+            row = self.actors_table.rowCount()
+            self.actors_table.insertRow(row)
+            self.actors_table.setItem(row, 0, QTableWidgetItem(str(actor.get("actor_id", ""))))
+            self.actors_table.setItem(row, 1, QTableWidgetItem(str(actor.get("role", ""))))
+            self.actors_table.setItem(row, 2, QTableWidgetItem(str(actor.get("description", ""))))
+
+    def _populate_provenance(self) -> None:
+        meta = self.current_report_payload.get("meta", {})
+        audit = self.current_report_payload.get("audit", {})
+        notes = str(audit.get("notes", "")) if isinstance(audit, dict) else ""
+
+        rows: list[tuple[str, str]] = []
+        if isinstance(meta, dict):
+            rows.append(("report_id", str(meta.get("report_id", ""))))
+            rows.append(("created_at", str(meta.get("created_at", ""))))
+        rows.append(("track_source", str(self.track_source_path or "not found")))
+        rows.append(("track_exists", "Yes" if self.track_source_path and Path(self.track_source_path).exists() else "No"))
+        if self.track_source_path and Path(self.track_source_path).exists():
+            mtime = datetime.fromtimestamp(Path(self.track_source_path).stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            rows.append(("track_last_modified", mtime))
+        if self.perception_json_path:
+            rows.append(("perception_json", str(self.perception_json_path)))
+
+        seen = {key.lower() for key, _value in rows}
+        for key, value in _parse_note_pairs(notes):
+            if key.lower() in seen:
+                continue
+            seen.add(key.lower())
+            rows.append((key, value))
+
+        self.provenance_table.setRowCount(0)
+        for key, value in rows:
+            row = self.provenance_table.rowCount()
+            self.provenance_table.insertRow(row)
+            self.provenance_table.setItem(row, 0, QTableWidgetItem(key))
+            self.provenance_table.setItem(row, 1, QTableWidgetItem(value))
+
+    def _on_claim_selected(self, row: int, _column: int) -> None:
+        if row < 0 or row >= len(self.claims):
+            self._set_claim_detail(None)
+            self._refresh_keyframes(None)
+            return
+        claim = self.claims[row]
+        self._set_claim_detail(claim)
+        self._refresh_keyframes(claim)
+
+    def _set_claim_detail(self, claim: dict[str, Any] | None) -> None:
+        if claim is None:
+            self.claim_detail.setPlainText("No claim selected.")
+            self.jump_button.setEnabled(False)
+            self.strongest_frame_for_claim = None
+            return
+
+        keyframes_raw = self.current_perception.get("keyframes", [])
+        keyframes_for_segment = [str(path) for path in keyframes_raw] if isinstance(keyframes_raw, list) else []
+        support = services.evaluate_claim_visual_support(
+            claim=claim,
+            keyframe_paths=keyframes_for_segment,
+            frames_json_path=str(self.frames_json_path) if self.frames_json_path else None,
+            video_path=self.source_video_path,
+            tracks_csv_path=self.track_source_path,
+        )
+        claim_id = str(claim.get("claim_id", "claim"))
+        track_evidence = self.claim_track_evidence_map.get(claim_id)
+        if track_evidence is None:
+            track_evidence = services.summarize_claim_track_evidence(
+                claim=claim,
+                keyframe_paths=keyframes_for_segment,
+                frames_json_path=str(self.frames_json_path) if self.frames_json_path else None,
+                video_path=self.source_video_path,
+                tracks_csv_path=self.track_source_path,
+            )
+            self.claim_track_evidence_map[claim_id] = track_evidence
+        impact_candidates = track_evidence.get("impact_pair_candidates", []) if isinstance(track_evidence, dict) else []
+        preferred_strongest = str(support.get("strongest_evidence_frame") or "")
+        if isinstance(impact_candidates, list) and impact_candidates:
+            first_candidate = impact_candidates[0]
+            if isinstance(first_candidate, dict):
+                peak_ts = first_candidate.get("peak_timestamp_sec")
+                if isinstance(peak_ts, (int, float)):
+                    nearest = self._nearest_keyframe_for_timestamp(
+                        keyframe_paths=keyframes_for_segment,
+                        target_timestamp=float(peak_ts),
+                    )
+                    if nearest:
+                        preferred_strongest = nearest
+
+        involvement = self._involvement_for_claim(claim_id)
+        ai_primary: list[int] = []
+        ai_suggested: list[int] = []
+        anchor_pair: list[int] = []
+        ai_confidence = 0.0
+        ai_method = ""
+        ai_rationale = ""
+        if isinstance(involvement, dict):
+            maybe_primary = involvement.get("primary_track_ids", [])
+            if isinstance(maybe_primary, list):
+                ai_primary = [int(tid) for tid in maybe_primary if str(tid).strip()]
+            maybe_ai_suggested = involvement.get("ai_primary_track_ids", [])
+            if isinstance(maybe_ai_suggested, list):
+                ai_suggested = [int(tid) for tid in maybe_ai_suggested if str(tid).strip()]
+            maybe_anchor = involvement.get("impact_anchor_pair_hint", [])
+            if isinstance(maybe_anchor, list):
+                anchor_pair = [int(tid) for tid in maybe_anchor if str(tid).strip()]
+            ai_confidence = float(involvement.get("decision_confidence", 0.0))
+            ai_method = str(involvement.get("method", "")).strip()
+            ai_rationale = str(involvement.get("rationale", "")).strip()
+        grounded_statement = (
+            " ".join(str(involvement.get("grounded_statement", "")).strip().split())
+            if isinstance(involvement, dict)
+            else ""
+        )
+        statement_text = grounded_statement or str(claim.get("statement", ""))
+        self.strongest_frame_for_claim = preferred_strongest
+        self.jump_button.setEnabled(bool(self.strongest_frame_for_claim))
+
+        linked_tracks = track_evidence.get("tracks", []) if isinstance(track_evidence, dict) else []
+        final_primary = ai_primary if ai_primary else (
+            track_evidence.get("involved_track_ids", []) if isinstance(track_evidence, dict) else []
+        )
+        final_primary_set = set(int(tid) for tid in final_primary if str(tid).strip())
+        context_top_lines: list[str] = []
+        if isinstance(linked_tracks, list):
+            for row in linked_tracks:
+                if not isinstance(row, dict):
+                    continue
+                tid = int(row.get("track_id", -1))
+                if tid < 0 or tid in final_primary_set:
+                    continue
+                context_top_lines.append(
+                    f"- {row.get('class_name', 'unknown')}#{tid} "
+                    f"(boxes={row.get('boxes', 0)}, max_conf={float(row.get('max_conf', 0.0)):.2f})"
+                )
+                if len(context_top_lines) >= 4:
+                    break
+
+        strongest_label = Path(self.strongest_frame_for_claim).name if self.strongest_frame_for_claim else "not available"
+        uncertainty = claim.get("uncertainty_flags", [])
+        uncertainty_text = ", ".join(str(flag) for flag in uncertainty) if isinstance(uncertainty, list) and uncertainty else "None"
+        evidence_frames = claim.get("evidence_frames", [])
+        evidence_text = str(evidence_frames) if isinstance(evidence_frames, list) else "No explicit frame links"
+        method_label = ai_method or "heuristic_fallback"
+        method_conf = f"{ai_confidence:.2f}" if ai_method == "ai" else "n/a"
+        context_count = track_evidence.get("context_track_count", 0) if isinstance(track_evidence, dict) else 0
+        impact_lines: list[str] = []
+        if isinstance(impact_candidates, list):
+            for item in impact_candidates[:3]:
+                if not isinstance(item, dict):
+                    continue
+                pair = item.get("pair", [])
+                if not isinstance(pair, list) or len(pair) != 2:
+                    continue
+                ts = item.get("peak_timestamp_sec", "na")
+                score = item.get("peak_score", "na")
+                impact_lines.append(f"- pair={pair} at t={ts}s (score={score})")
+
+        lines = [
+            f"Claim {claim_id} | {claim.get('event_type', 'unknown')} | support={float(claim.get('support_confidence', 0.0)):.2f}",
+            "",
+            "Statement",
+            statement_text,
+            "",
+            "Direct Involvement",
+            f"- Final involved track IDs: {final_primary if final_primary else 'not resolved'}",
+            f"- Impact anchor pair: {anchor_pair if anchor_pair else 'not available'}",
+            f"- Method: {method_label} | confidence={method_conf}",
+        ]
+        if ai_suggested:
+            lines.append(f"- AI suggested IDs: {ai_suggested}")
+        lines.extend(
+            [
+                "",
+                "Evidence",
+                f"- Evidence frames: {evidence_text}",
+                f"- Visual support: {support.get('visual_support_level', 'weak')}",
+                f"- Strongest evidence frame: {strongest_label}",
+                f"- Context tracks in evidence window: {context_count}",
+            ]
+        )
+        if impact_lines:
+            lines.extend(["- Impact pair candidates by evidence strength:"])
+            lines.extend(impact_lines)
+        if context_top_lines:
+            lines.extend(["", "Top context tracks (not marked directly involved):"])
+            lines.extend(context_top_lines)
+        lines.extend(["", f"Uncertainty: {uncertainty_text}"])
+        if ai_rationale:
+            lines.extend(["", f"Rationale: {ai_rationale}"])
+        self.claim_detail.setPlainText("\n".join(str(line) for line in lines))
+
+    def _nearest_keyframe_for_timestamp(self, keyframe_paths: list[str], target_timestamp: float) -> str | None:
+        best_path: str | None = None
+        best_delta = float("inf")
+        for path in keyframe_paths:
+            if not Path(path).exists():
+                continue
+            meta = services.resolve_keyframe_metadata(
+                keyframe_path=path,
+                frames_json_path=str(self.frames_json_path) if self.frames_json_path else None,
+                video_path=self.source_video_path,
+                fallback_fps=2.0,
+            )
+            ts = meta.get("timestamp_sec")
+            if not isinstance(ts, (int, float)):
+                continue
+            delta = abs(float(ts) - float(target_timestamp))
+            if delta < best_delta:
+                best_delta = delta
+                best_path = path
+        return best_path
+
+    def _involvement_for_claim(self, claim_id: str) -> dict[str, Any]:
+        if not claim_id:
+            return {}
+        current_segment_id = str(self.current_segment.get("segment_id", "")).strip()
+        if not self.involvement_segment_id or self.involvement_segment_id != current_segment_id:
+            return {}
+        involvement = self.claim_involvement_map.get(claim_id, {})
+        return involvement if isinstance(involvement, dict) else {}
+
+    def _refresh_keyframes(self, claim: dict[str, Any] | None) -> None:
+        keyframes_raw = self.current_perception.get("keyframes", [])
+        all_paths = [str(path) for path in keyframes_raw] if isinstance(keyframes_raw, list) else []
+        existing_paths = [path for path in all_paths if Path(path).exists()]
+        filtered = services.map_claim_to_keyframes(claim, existing_paths) if claim else existing_paths
+        if claim and not filtered:
+            filtered = existing_paths
+
+        self.keyframe_rows = []
+        for path in filtered:
+            meta = services.resolve_keyframe_metadata(
+                keyframe_path=path,
+                frames_json_path=str(self.frames_json_path) if self.frames_json_path else None,
+                video_path=self.source_video_path,
+                fallback_fps=2.0,
+            )
+            sampled_idx = meta.get("sampled_frame_idx")
+            source_idx = meta.get("source_frame_idx")
+            timestamp = meta.get("timestamp_sec")
+            quality = meta.get("mapping_quality", "fallback")
+            label = (
+                f"kf={sampled_idx if sampled_idx is not None else 'na'} | "
+                f"src={source_idx if source_idx is not None else 'na'} | "
+                f"t={(float(timestamp) if timestamp is not None else -1):.2f}s | "
+                f"map={quality}"
+            )
+            self.keyframe_rows.append(KeyframeRow(label=label, path=path, meta=meta))
+
+        self.keyframe_combo.blockSignals(True)
+        self.keyframe_combo.clear()
+        for item in self.keyframe_rows:
+            self.keyframe_combo.addItem(item.label)
+        self.keyframe_combo.blockSignals(False)
+
+        if self.keyframe_rows:
+            self.keyframe_combo.setCurrentIndex(0)
+            self._on_keyframe_changed(0)
+        else:
+            self.evidence_image.clear_image("No keyframes available for selected claim/segment.")
+            self.evidence_meta_label.setText("No keyframes available.")
+    def _on_keyframe_changed(self, index: int) -> None:
+        if index < 0 or index >= len(self.keyframe_rows):
+            self.evidence_image.clear_image("No keyframe selected.")
+            self.evidence_meta_label.setText("No keyframe selected.")
+            return
+
+        row = self.keyframe_rows[index]
+        timestamp = row.meta.get("timestamp_sec")
+        current_claim = self._current_selected_claim()
+        claim_id = str(current_claim.get("claim_id", "all")) if current_claim else "all"
+        event_type = str(current_claim.get("event_type", self.summary_event.text())) if current_claim else self.summary_event.text()
+        confidence = float(current_claim.get("support_confidence", 0.0)) if current_claim else 0.0
+
+        box_render_path = self.outputs_dir / "_rendered_frames" / f"{Path(row.path).stem}_desktop_track_overlay.jpg"
+        box_meta = services.render_keyframe_with_tracks(
+            keyframe_image_path=row.path,
+            keyframe_timestamp_sec=float(timestamp) if timestamp is not None else None,
+            tracks_csv_path=self.track_source_path,
+            out_path=str(box_render_path),
+            video_path=self.source_video_path,
+        )
+        overlay_lines = [
+            f"t={(float(timestamp) if timestamp is not None else -1):.2f}s",
+            f"segment={self.current_segment.get('segment_id', 'segment')}",
+            f"claim={claim_id}",
+            f"event={event_type} conf={confidence:.2f}",
+        ]
+        rendered_path = services.render_annotated_keyframe(
+            image_path=str(box_render_path),
+            output_path="",
+            overlay_lines=overlay_lines,
+        )
+        self.rendered_frame_path = rendered_path
+        self.evidence_image.set_image_path(rendered_path)
+        self.evidence_meta_label.setText(
+            f"Evidence frame {index + 1} of {len(self.keyframe_rows)} | "
+            f"Matched boxes: {box_meta.get('boxes_drawn', 0)}"
+        )
+
+    def _current_selected_claim(self) -> dict[str, Any] | None:
+        row = self.claims_table.currentRow()
+        if row < 0 or row >= len(self.claims):
+            return None
+        return self.claims[row]
+
+    def _on_jump_strongest_frame(self) -> None:
+        if not self.strongest_frame_for_claim:
+            return
+        for idx, keyframe in enumerate(self.keyframe_rows):
+            if keyframe.path == self.strongest_frame_for_claim:
+                self.keyframe_combo.setCurrentIndex(idx)
+                return
+
+    def _on_play_pause(self) -> None:
+        if self.player.source().isEmpty():
+            QMessageBox.information(self, "No video", "No annotated video found for this case.")
+            return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def _on_playback_speed_changed(self, _index: int) -> None:
+        raw_rate = self.playback_speed_combo.currentData()
+        try:
+            rate = float(raw_rate)
+        except Exception:
+            rate = 1.0
+        if rate <= 0:
+            rate = 1.0
+        self.player.setPlaybackRate(rate)
+
+    def _on_video_seek(self, value: int) -> None:
+        self.player.setPosition(int(value))
+
+    def _on_video_position_changed(self, position: int) -> None:
+        if not self.video_slider.isSliderDown():
+            self.video_slider.setValue(int(position))
+        self._update_video_time(position, self.player.duration())
+
+    def _on_video_duration_changed(self, duration: int) -> None:
+        self.video_slider.setRange(0, int(duration))
+        self._update_video_time(self.player.position(), duration)
+
+    def _on_playback_state_changed(self, state: QMediaPlayer.PlaybackState) -> None:
+        self.play_pause_btn.setText("Pause" if state == QMediaPlayer.PlaybackState.PlayingState else "Play")
+
+    def _update_video_time(self, position: int, duration: int) -> None:
+        self.video_time_label.setText(f"{self._fmt_ms(position)} / {self._fmt_ms(duration)}")
+
+    @staticmethod
+    def _fmt_ms(ms: int) -> str:
+        total = max(0, int(ms // 1000))
+        minutes = total // 60
+        seconds = total % 60
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _on_save_reviewed_copy(self) -> None:
+        if not self.current_report_path:
+            QMessageBox.warning(self, "No report", "No report is currently selected.")
+            return
+        try:
+            reviewed_path = services.save_reviewed_copy(
+                report_path=self.current_report_path,
+                override_event_type=self.override_event.currentText(),
+                override_severity=self.override_severity.currentText(),
+                reviewer_note=self.reviewer_note.toPlainText().strip(),
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Save failed", f"Could not save reviewed report.\n{exc}")
+            return
+        self.statusBar().showMessage(f"Reviewed copy saved: {reviewed_path}")
+        QMessageBox.information(self, "Reviewed copy saved", reviewed_path)
+
+
+def run_desktop_app(argv: list[str] | None = None) -> int:
+    args = argv if argv is not None else sys.argv
+    app = QApplication(args)
+    app.setApplicationName("Traffic Incident Reporter Desktop")
+    window = IncidentReviewerWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_desktop_app())

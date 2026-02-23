@@ -1,0 +1,11 @@
+from __future__ import annotations
+
+if __name__ == "__main__":
+    try:
+        from src.desktop_ui import run_desktop_app
+    except Exception as exc:
+        raise SystemExit(
+            "Desktop app dependencies are missing. Install with `pip install -r requirements.txt`.\n"
+            f"Details: {exc}"
+        ) from exc
+    raise SystemExit(run_desktop_app())

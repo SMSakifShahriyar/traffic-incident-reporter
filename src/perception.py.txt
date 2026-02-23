@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+from typing import Any
+
+from .normalize import normalize_perception_payload
+from .openai_client import OpenAIResponsesClient
+
+
+def load_segments_csv(path: str | Path) -> list[dict[str, Any]]:
+
+    csv_path = Path(path)
+    if not csv_path.exists() or not csv_path.is_file():
+        raise FileNotFoundError(f"Segments CSV not found: {csv_path}")
+
+    segments: list[dict[str, Any]] = []
+    with csv_path.open("r", encoding="utf-8", newline="") as fp:
+        reader = csv.DictReader(fp)
+        for row in reader:
+            if not row:
+                continue
+            segment_id = str(row.get("segment_id", "")).strip()
+            if not segment_id:
+                continue
+            try:
+                start_sec = float(row.get("start_sec", "0"))
+                end_sec = float(row.get("end_sec", "0"))
+            except ValueError as exc:
+                raise ValueError(f"Invalid segment times in CSV row: {row}") from exc
+            if end_sec <= start_sec:
+                continue
+            segments.append(
+                {
+                    "segment_id": segment_id,
+                    "start_sec": start_sec,
+                    "end_sec": end_sec,
+                }
+            )
+
+    return sorted(segments, key=lambda item: float(item["start_sec"]))
+
+
+def _evenly_spaced_indices(count: int, k: int) -> list[int]:
+    if count <= 0 or k <= 0:
+        return []
+    if k >= count:
+        return list(range(count))
+    if k == 1:
+        return [0]
+
+    indices: list[int] = []
+    for i in range(k):
+        idx = int(round(i * (count - 1) / (k - 1)))
+        if idx not in indices:
+            indices.append(idx)
+
+    cursor = 0
+    while len(indices) < k and cursor < count:
+        if cursor not in indices:
+            indices.append(cursor)
+        cursor += 1
+
+    return sorted(indices[:k])
+
+
+def select_keyframes_for_segment(
+    frames: list[dict[str, Any]],
+    start_sec: float,
+    end_sec: float,
+    max_frames: int,
+) -> list[dict[str, Any]]:
+
+    if max_frames <= 0:
+        raise ValueError("max_frames must be greater than 0")
+
+    ordered = sorted(frames, key=lambda item: float(item["time_sec"]))
+    in_window = [
+        frame
+        for frame in ordered
+        if start_sec <= float(frame.get("time_sec", -1.0)) <= end_sec
+    ]
+
+    if not in_window and ordered:
+        midpoint = (start_sec + end_sec) / 2.0
+        nearest = min(ordered, key=lambda item: abs(float(item["time_sec"]) - midpoint))
+        in_window = [nearest]
+
+    if not in_window:
+        return []
+
+    indices = _evenly_spaced_indices(len(in_window), min(max_frames, len(in_window)))
+    return [in_window[idx] for idx in indices]
+
+
+def perceive_segments(
+    frames: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+    prompt_text: str,
+    model: str,
+    max_frames: int,
+    max_retries: int = 2,
+) -> list[dict[str, Any]]:
+
+    client = OpenAIResponsesClient.from_env()
+    results: list[dict[str, Any]] = []
+
+    for segment in segments:
+        segment_id = str(segment["segment_id"])
+        start_sec = float(segment["start_sec"])
+        end_sec = float(segment["end_sec"])
+        keyframes = select_keyframes_for_segment(frames, start_sec, end_sec, max_frames=max_frames)
+        keyframe_paths = [str(frame.get("path", "")) for frame in keyframes if str(frame.get("path", "")).strip()]
+
+        result: dict[str, Any] = {
+            "segment_id": segment_id,
+            "start_sec": round(start_sec, 6),
+            "end_sec": round(end_sec, 6),
+            "keyframes": keyframe_paths,
+            "model": model,
+            "model_name": model,
+            "perception": normalize_perception_payload({}),
+            "status": "error",
+            "error": None,
+        }
+
+        if not keyframe_paths:
+            result["error"] = "No usable keyframes for this segment"
+            results.append(result)
+            continue
+
+        try:
+            raw = client.perceive_with_images(
+                model=model,
+                prompt_text=prompt_text,
+                image_paths=keyframe_paths,
+                max_retries=max_retries,
+            )
+            result["perception"] = normalize_perception_payload(raw)
+            result["status"] = "ok"
+            result["error"] = None
+        except Exception as exc:
+            result["status"] = "error"
+            result["error"] = str(exc)
+
+        results.append(result)
+
+    return results

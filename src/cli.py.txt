@@ -1,0 +1,478 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from . import app_services
+from .assemble import build_incident_report, build_report_filename, save_report_json
+from .config import load_app_config
+from .detect_track import run_detect_track, summarize_tracks_for_segment
+from .ingest import extract_sampled_frames, probe_video
+from .involvement import run_involvement_for_report
+from .perception import load_segments_csv, perceive_segments
+from .segment import build_energy_series, propose_candidate_segments, save_segments_csv
+
+
+def _read_frames_json(path: Path) -> list[dict[str, float | int | str]]:
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"Frames JSON not found: {path}")
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict):
+        frames = payload.get("frames")
+        if isinstance(frames, list):
+            return frames
+        raise ValueError(f"Frames JSON missing a list under 'frames': {path}")
+
+    if isinstance(payload, list):
+        return payload
+
+    raise ValueError(f"Unsupported frames JSON structure: {path}")
+
+
+def _derive_energy_json_path(out_csv_path: Path) -> Path:
+    stem = out_csv_path.stem
+    if stem.endswith("_segments"):
+        base = stem[: -len("_segments")]
+        energy_name = f"{base}_energy.json"
+    else:
+        energy_name = f"{stem}_energy.json"
+    return out_csv_path.with_name(energy_name)
+
+
+def _parse_bool(value: str) -> bool:
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
+def _parse_classes_csv(value: str) -> list[str]:
+    classes = [part.strip() for part in str(value).split(",") if part.strip()]
+    return classes
+
+
+def _run_ingest(args: argparse.Namespace) -> None:
+    config = load_app_config(args.env)
+
+    sample_fps = args.sample_fps if args.sample_fps is not None else config.frame_sample_fps
+    short_side_resize = (
+        args.short_side_resize if args.short_side_resize is not None else config.short_side_resize
+    )
+
+    video_path = Path(args.video)
+    out_dir = Path(args.out)
+
+    video_meta = probe_video(video_path)
+    sampled_frames = extract_sampled_frames(
+        video_path=video_path,
+        out_dir=out_dir,
+        sample_fps=sample_fps,
+        short_side_resize=short_side_resize,
+    )
+
+    outputs_dir = Path("data") / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    frames_json_path = outputs_dir / f"{video_path.stem}_frames.json"
+
+    frames_payload = {
+        "video_path": str(video_path),
+        "probe": video_meta,
+        "frames": sampled_frames,
+    }
+    frames_json_path.write_text(json.dumps(frames_payload, indent=2), encoding="utf-8")
+
+    print(
+        "INGEST_OK "
+        f"video={video_path} sampled_frames={len(sampled_frames)} "
+        f"frames_json={frames_json_path} cache_dir={out_dir}"
+    )
+
+
+def _run_segment(args: argparse.Namespace) -> None:
+    config = load_app_config(args.env)
+
+    frames_json_path = Path(args.frames_json)
+    out_csv_path = Path(args.out_csv)
+
+    sampled_frames = _read_frames_json(frames_json_path)
+    energy_series = build_energy_series(sampled_frames)
+    segments = propose_candidate_segments(
+        energy_series,
+        min_segment_sec=config.min_segment_sec,
+        max_segment_sec=config.max_segment_sec,
+        threshold_quantile=config.energy_threshold_quantile,
+        merge_gap_sec=config.merge_gap_sec,
+        max_segments=args.max_segments,
+    )
+
+    save_segments_csv(segments, out_csv_path)
+
+    energy_json_path = _derive_energy_json_path(out_csv_path)
+    energy_json_path.write_text(json.dumps(energy_series, indent=2), encoding="utf-8")
+
+    print(
+        "SEGMENT_OK "
+        f"frames_json={frames_json_path} energy_points={len(energy_series)} "
+        f"segments={len(segments)} max_segments={args.max_segments} "
+        f"energy_json={energy_json_path} out_csv={out_csv_path}"
+    )
+
+
+def _run_perceive(args: argparse.Namespace) -> None:
+    frames_json_path = Path(args.frames_json)
+    segments_csv_path = Path(args.segments_csv)
+    out_json_path = Path(args.out_json)
+    prompt_path = Path("prompts") / "perception.txt"
+
+    if not prompt_path.exists() or not prompt_path.is_file():
+        raise FileNotFoundError(f"Perception prompt file not found: {prompt_path}")
+
+    frames = _read_frames_json(frames_json_path)
+    segments = load_segments_csv(segments_csv_path)
+    prompt_text = prompt_path.read_text(encoding="utf-8").strip()
+
+    results = perceive_segments(
+        frames=frames,
+        segments=segments,
+        prompt_text=prompt_text,
+        model=args.model,
+        max_frames=args.max_frames,
+        max_retries=2,
+    )
+
+    out_json_path.parent.mkdir(parents=True, exist_ok=True)
+    out_json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+
+    total = len(results)
+    ok_count = sum(1 for item in results if item.get("status") == "ok")
+    fail_count = total - ok_count
+    print(f"PERCEIVE_OK total={total} ok={ok_count} failed={fail_count} out_json={out_json_path}")
+
+
+def _run_assemble(args: argparse.Namespace) -> None:
+    perception_json_path = Path(args.perception_json)
+    source_video = Path(args.source_video)
+    out_dir = Path(args.out_dir)
+
+    if not perception_json_path.exists() or not perception_json_path.is_file():
+        raise FileNotFoundError(f"Perception JSON not found: {perception_json_path}")
+
+    payload = json.loads(perception_json_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError("Perception JSON must be a list of segment-level items")
+    sidecar_model_name: str | None = None
+    sidecar_path = Path(f"{perception_json_path}.meta.json")
+    if sidecar_path.exists() and sidecar_path.is_file():
+        try:
+            sidecar_payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        except Exception:
+            sidecar_payload = {}
+        if isinstance(sidecar_payload, dict):
+            raw_model = str(sidecar_payload.get("model", "")).strip()
+            sidecar_model_name = raw_model or None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    total = len(payload)
+    ok_count = 0
+    failed = 0
+    source_stem = source_video.stem
+    candidate_track_csv = (Path("data") / "outputs" / f"{source_stem}_tracks.csv").resolve()
+    track_csv_path: Path | None = candidate_track_csv if candidate_track_csv.exists() else None
+
+    for item in payload:
+        if not isinstance(item, dict):
+            failed += 1
+            continue
+
+        try:
+            track_segment_summary = None
+            if track_csv_path is not None:
+                start_sec = float(item.get("start_sec", 0.0))
+                end_sec = float(item.get("end_sec", start_sec))
+                track_segment_summary = summarize_tracks_for_segment(
+                    tracks_csv_path=str(track_csv_path),
+                    start_sec=start_sec,
+                    end_sec=end_sec,
+                )
+
+            report_item = dict(item)
+            if sidecar_model_name and not str(report_item.get("model_name", "")).strip():
+                report_item["model_name"] = sidecar_model_name
+            if sidecar_model_name and not str(report_item.get("model", "")).strip():
+                report_item["model"] = sidecar_model_name
+
+            report = build_incident_report(
+                report_item,
+                source_video=str(source_video),
+                track_segment_summary=track_segment_summary,
+                track_source=str(track_csv_path) if track_csv_path else None,
+                enhance_claims_with_ai=bool(args.enhance_claims),
+                claim_writer_model=str(args.writer_model),
+                claim_writer_max_frames=int(args.writer_max_frames),
+                claim_writer_max_retries=int(args.writer_max_retries),
+                require_ai_claims=bool(args.require_claim_writer),
+            )
+            segment_id = str(item.get("segment_id", "seg")).strip() or "seg"
+            event_type = report.overall_assessment.event_type.value
+            out_name = build_report_filename(source_stem, segment_id, event_type)
+            save_report_json(report, out_dir / out_name)
+            ok_count += 1
+        except Exception:
+            failed += 1
+
+    print(f"ASSEMBLE_OK total={total} ok={ok_count} failed={failed} out_dir={out_dir}")
+
+
+def _run_detecttrack(args: argparse.Namespace) -> None:
+    video_path = Path(args.video)
+    out_dir = Path(args.out_dir)
+    if not video_path.exists() or not video_path.is_file():
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    class_list = _parse_classes_csv(args.classes)
+    result = run_detect_track(
+        video_path=str(video_path),
+        out_dir=str(out_dir),
+        model_name=args.model if args.model else None,
+        tracker=args.tracker,
+        conf=float(args.conf),
+        iou=float(args.iou),
+        classes=class_list,
+        save_annotated=_parse_bool(args.save_annotated),
+    )
+
+    print(
+        "DETECTTRACK_OK "
+        f"video={video_path} detections={result['num_detections']} tracks={result['num_tracks']} "
+        f"csv={result['tracks_csv']} summary={result['summary_json']} annotated={result['annotated_video']}"
+    )
+
+
+def _run_involve(args: argparse.Namespace) -> None:
+    result = run_involvement_for_report(
+        report_json_path=args.report_json,
+        perception_json_path=args.perception_json,
+        frames_json_path=args.frames_json,
+        tracks_csv_path=args.tracks_csv,
+        out_json_path=args.out_json,
+        model=args.model,
+        max_frames=args.max_frames,
+        max_retries=2,
+        use_ai=not args.no_ai,
+        prompt_path=args.prompt,
+    )
+    grounded_updates = 0
+    try:
+        if _parse_bool(args.update_report):
+            grounding = app_services.apply_grounded_claims_to_report(
+                report_json_path=args.report_json,
+                involvement_json_path=result["out_json"],
+            )
+            grounded_updates = int(grounding.get("updated_claims", 0))
+    except Exception:
+        grounded_updates = 0
+    print(
+        "INVOLVE_OK "
+        f"claims={result['claims']} ai_used={result['ai_used']} fallback={result['fallback_used']} "
+        f"out_json={result['out_json']} grounded_updates={grounded_updates}"
+    )
+
+
+def _run_rebuild(args: argparse.Namespace) -> None:
+    class_list = _parse_classes_csv(args.classes)
+    result = app_services.run_full_fresh_rebuild(
+        video_path=args.video,
+        outputs_dir=args.out_dir,
+        model=args.model,
+        max_frames=int(args.max_frames),
+        tracker=args.tracker,
+        conf=float(args.conf),
+        iou=float(args.iou),
+        classes=class_list,
+        save_annotated=_parse_bool(args.save_annotated),
+        enhance_claims=_parse_bool(args.enhance_claims),
+        writer_model=args.writer_model,
+        writer_max_frames=int(args.writer_max_frames),
+        writer_max_retries=int(args.writer_max_retries),
+        require_claim_writer=_parse_bool(args.require_claim_writer),
+        involvement_model=args.involvement_model,
+        involvement_max_frames=int(args.involvement_max_frames),
+        involvement_use_ai=_parse_bool(args.involvement_ai),
+    )
+    print(
+        "REBUILD_OK "
+        f"video={args.video} segments={result['segment_count']} "
+        f"perception_ok={result['perception_ok']} reports={result['assemble_ok']} "
+        f"primary_report={result['primary_report_path']} involvement={result['involvement_json']} "
+        f"grounded_updates={result.get('grounded_claim_updates', 0)}"
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="traffic-incident-reporter CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    ingest_parser = subparsers.add_parser("ingest", help="Probe video and extract sampled frames")
+    ingest_parser.add_argument("--video", required=True, help="Path to input video")
+    ingest_parser.add_argument("--out", required=True, help="Directory to save sampled JPEG frames")
+    ingest_parser.add_argument("--sample-fps", type=float, default=None, help="Frame sampling FPS")
+    ingest_parser.add_argument(
+        "--short-side-resize",
+        type=int,
+        default=None,
+        help="Resize so image short side equals this value",
+    )
+    ingest_parser.add_argument("--env", default=None, help="Optional .env path")
+    ingest_parser.set_defaults(func=_run_ingest)
+
+    segment_parser = subparsers.add_parser("segment", help="Build energy series and propose segments")
+    segment_parser.add_argument("--frames-json", required=True, help="Path to frame metadata JSON")
+    segment_parser.add_argument("--out-csv", required=True, help="Path to output segments CSV")
+    segment_parser.add_argument(
+        "--max-segments",
+        type=int,
+        default=3,
+        help="Maximum number of returned candidate segments",
+    )
+    segment_parser.add_argument("--env", default=None, help="Optional .env path")
+    segment_parser.set_defaults(func=_run_segment)
+
+    perceive_parser = subparsers.add_parser("perceive", help="Run perception on candidate segments")
+    perceive_parser.add_argument("--frames-json", required=True, help="Path to frame metadata JSON")
+    perceive_parser.add_argument("--segments-csv", required=True, help="Path to candidate segments CSV")
+    perceive_parser.add_argument("--out-json", required=True, help="Path to output perception JSON")
+    perceive_parser.add_argument("--model", required=True, help="Vision-capable model name")
+    perceive_parser.add_argument("--max-frames", type=int, default=4, help="Max keyframes per segment")
+    perceive_parser.set_defaults(func=_run_perceive)
+
+    assemble_parser = subparsers.add_parser("assemble", help="Build strict IncidentReport JSON per segment")
+    assemble_parser.add_argument("--perception-json", required=True, help="Path to perception results JSON")
+    assemble_parser.add_argument("--source-video", required=True, help="Path to source video")
+    assemble_parser.add_argument("--out-dir", required=True, help="Directory for report JSON files")
+    assemble_parser.add_argument(
+        "--enhance-claims",
+        action="store_true",
+        help="Use OpenAI to rewrite claim statements for higher-quality incident narratives",
+    )
+    assemble_parser.add_argument(
+        "--writer-model",
+        default="gpt-4.1",
+        help="Model name used by claim writer",
+    )
+    assemble_parser.add_argument(
+        "--writer-max-frames",
+        type=int,
+        default=8,
+        help="Max keyframes provided to claim writer",
+    )
+    assemble_parser.add_argument(
+        "--writer-max-retries",
+        type=int,
+        default=2,
+        help="Retry count for claim writer requests",
+    )
+    assemble_parser.add_argument(
+        "--require-claim-writer",
+        action="store_true",
+        help="Fail assemble if AI claim writer is skipped/failed when --enhance-claims is used",
+    )
+    assemble_parser.set_defaults(func=_run_assemble)
+
+    detecttrack_parser = subparsers.add_parser("detecttrack", help="Run local road-user detection + tracking")
+    detecttrack_parser.add_argument("--video", required=True, help="Path to source video")
+    detecttrack_parser.add_argument("--out-dir", required=True, help="Directory for tracking outputs")
+    detecttrack_parser.add_argument("--model", default="", help="YOLO model name/path; blank uses default resolver")
+    detecttrack_parser.add_argument(
+        "--tracker",
+        default="botsort.yaml",
+        choices=["botsort.yaml", "bytetrack.yaml"],
+        help="Tracker configuration",
+    )
+    detecttrack_parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
+    detecttrack_parser.add_argument("--iou", type=float, default=0.5, help="IOU threshold")
+    detecttrack_parser.add_argument(
+        "--classes",
+        default="person,bicycle,car,motorcycle,bus,truck",
+        help="Comma-separated class whitelist",
+    )
+    detecttrack_parser.add_argument(
+        "--save-annotated",
+        default="true",
+        help="Whether to save annotated video: true/false",
+    )
+    detecttrack_parser.set_defaults(func=_run_detecttrack)
+
+    involve_parser = subparsers.add_parser("involve", help="Select primary involved tracks for claims")
+    involve_parser.add_argument("--report-json", required=True, help="Path to report JSON")
+    involve_parser.add_argument("--perception-json", required=True, help="Path to perception JSON")
+    involve_parser.add_argument("--frames-json", required=True, help="Path to frames JSON")
+    involve_parser.add_argument("--tracks-csv", required=True, help="Path to tracks CSV")
+    involve_parser.add_argument("--out-json", required=True, help="Path to output involvement JSON")
+    involve_parser.add_argument("--model", default="gpt-4.1", help="Model name for involvement selection")
+    involve_parser.add_argument("--max-frames", type=int, default=6, help="Max keyframes used per claim")
+    involve_parser.add_argument(
+        "--prompt",
+        default=str(Path("prompts") / "involvement.txt"),
+        help="Prompt template path",
+    )
+    involve_parser.add_argument("--no-ai", action="store_true", help="Disable AI and use heuristic fallback only")
+    involve_parser.add_argument(
+        "--update-report",
+        default="true",
+        help="Apply grounded statements back to report true/false",
+    )
+    involve_parser.set_defaults(func=_run_involve)
+
+    rebuild_parser = subparsers.add_parser("rebuild", help="One-click full fresh rebuild of the full pipeline")
+    rebuild_parser.add_argument("--video", required=True, help="Path to source video")
+    rebuild_parser.add_argument("--out-dir", default="data/outputs", help="Outputs directory")
+    rebuild_parser.add_argument("--model", default="gpt-4.1", help="Perception model name")
+    rebuild_parser.add_argument("--max-frames", type=int, default=12, help="Max frames per segment for perception")
+    rebuild_parser.add_argument(
+        "--tracker",
+        default="botsort.yaml",
+        choices=["botsort.yaml", "bytetrack.yaml"],
+        help="Tracker configuration",
+    )
+    rebuild_parser.add_argument("--conf", type=float, default=0.25, help="Detection confidence threshold")
+    rebuild_parser.add_argument("--iou", type=float, default=0.5, help="Detection IOU threshold")
+    rebuild_parser.add_argument(
+        "--classes",
+        default="person,bicycle,car,motorcycle,bus,truck",
+        help="Comma-separated class whitelist",
+    )
+    rebuild_parser.add_argument("--save-annotated", default="true", help="Save annotated video true/false")
+    rebuild_parser.add_argument("--enhance-claims", default="true", help="Enable AI claim writer true/false")
+    rebuild_parser.add_argument("--writer-model", default="gpt-4.1", help="Claim-writer model")
+    rebuild_parser.add_argument("--writer-max-frames", type=int, default=12, help="Max frames for claim-writer")
+    rebuild_parser.add_argument("--writer-max-retries", type=int, default=2, help="Claim-writer retries")
+    rebuild_parser.add_argument(
+        "--require-claim-writer",
+        default="false",
+        help="Fail rebuild if AI claim-writer cannot run true/false",
+    )
+    rebuild_parser.add_argument("--involvement-model", default="gpt-4.1", help="Involvement model")
+    rebuild_parser.add_argument("--involvement-max-frames", type=int, default=8, help="Involvement max frames")
+    rebuild_parser.add_argument("--involvement-ai", default="true", help="Enable AI for involvement true/false")
+    rebuild_parser.set_defaults(func=_run_rebuild)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        args.func(args)
+    except Exception as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
+
+
+if __name__ == "__main__":
+    main()

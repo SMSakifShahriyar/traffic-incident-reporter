@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from typing import Any
+
+
+ACTOR_TYPES = {"vehicle", "pedestrian", "cyclist", "motorcycle", "truck", "bus", "unknown"}
+WEATHER_TYPES = {"clear", "rain", "snow", "fog", "unknown"}
+LIGHTING_TYPES = {"day", "night", "dawn_dusk", "tunnel", "unknown"}
+ROAD_SURFACE_TYPES = {"dry", "wet", "icy", "unknown"}
+CONFLICT_TYPES = {"collision_risk", "near_miss_risk", "obstruction", "violation", "unknown"}
+
+
+def _as_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if parsed < 0.0:
+        return 0.0
+    if parsed > 1.0:
+        return 1.0
+    return parsed
+
+
+def _normalize_enum(value: Any, allowed: set[str]) -> str:
+    raw = _as_str(value, default="unknown").strip().lower()
+    if raw in allowed:
+        return raw
+    return "unknown"
+
+
+def _normalize_visible_actor(item: Any) -> dict[str, Any]:
+    src = item if isinstance(item, dict) else {}
+    return {
+        "type": _normalize_enum(src.get("type"), ACTOR_TYPES),
+        "confidence": _as_float(src.get("confidence"), default=0.0),
+        "description": _as_str(src.get("description"), default=""),
+    }
+
+
+def _normalize_conflict(item: Any) -> dict[str, Any]:
+    src = item if isinstance(item, dict) else {}
+    return {
+        "type": _normalize_enum(src.get("type"), CONFLICT_TYPES),
+        "confidence": _as_float(src.get("confidence"), default=0.0),
+        "description": _as_str(src.get("description"), default=""),
+    }
+
+
+def normalize_perception_payload(payload: Any) -> dict[str, Any]:
+
+    src = payload if isinstance(payload, dict) else {}
+
+    visible_actors_raw = src.get("visible_actors", [])
+    if not isinstance(visible_actors_raw, list):
+        visible_actors_raw = [visible_actors_raw]
+    visible_actors = [_normalize_visible_actor(item) for item in visible_actors_raw]
+
+    scene_raw = src.get("scene_conditions", {})
+    if not isinstance(scene_raw, dict):
+        scene_raw = {}
+    scene_conditions = {
+        "weather": _normalize_enum(scene_raw.get("weather"), WEATHER_TYPES),
+        "lighting": _normalize_enum(scene_raw.get("lighting"), LIGHTING_TYPES),
+        "road_surface": _normalize_enum(scene_raw.get("road_surface"), ROAD_SURFACE_TYPES),
+    }
+
+    conflicts_raw = src.get("potential_conflicts", [])
+    if not isinstance(conflicts_raw, list):
+        conflicts_raw = [conflicts_raw]
+    potential_conflicts = [_normalize_conflict(item) for item in conflicts_raw]
+
+    return {
+        "visible_actors": visible_actors,
+        "scene_conditions": scene_conditions,
+        "potential_conflicts": potential_conflicts,
+        "notes": _as_str(src.get("notes"), default=""),
+    }
